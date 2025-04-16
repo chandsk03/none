@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import random
-import sqlite3
 import os
 import hashlib
 import json
@@ -19,9 +18,9 @@ from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.exceptions import TelegramNetworkError, TelegramBadRequest
 from aiogram.client.default import DefaultBotProperties
 from telethon.sync import TelegramClient
-from telethon.tl.functions.contacts import ReportSpamRequest
 from telethon.tl.functions.messages import ReportRequest
 from telethon.tl.types import InputPeerUser
+from telethon.errors import FloodWaitError, PeerIdInvalidError
 import re
 import aiosqlite
 from functools import lru_cache
@@ -30,7 +29,7 @@ from functools import lru_cache
 try:
     aiogram_version = importlib.metadata.version("aiogram")
     if tuple(map(int, aiogram_version.split('.'))) < (3, 7, 0):
-        logging.warning(f"aiogram version {aiogram_version} detected. Recommend upgrading to >=3.7.0 for full compatibility.")
+        logging.warning(f"aiogram version {aiogram_version} detected. Recommend upgrading to >=3.7.0.")
 except importlib.metadata.PackageNotFoundError:
     logging.error("aiogram not installed. Please install with 'pip install aiogram>=3.7.0'.")
     exit(1)
@@ -56,6 +55,7 @@ MESSAGE_DELETE_DELAY = 600  # seconds (10 minutes)
 CAPTCHA_DELETE_DELAY = 900  # seconds (15 minutes)
 REPORT_STATUS_UPDATE_INTERVAL = 600  # seconds (10 minutes)
 FRAUD_REPORT_INTERVAL = 1800  # seconds (30 minutes)
+SESSION_HEALTH_CHECK_INTERVAL = 86400  # seconds (24 hours)
 SESSION_DIR = "sessions"
 DB_PATH = "reports.db"
 ANALYTICS_CACHE_TTL = 300  # seconds (5 minutes)
@@ -272,11 +272,13 @@ async def retry_api_call(coro, max_attempts: int = RETRY_ATTEMPTS, delay: float 
     for attempt in range(max_attempts):
         try:
             return await coro
-        except (TelegramNetworkError, TelegramBadRequest) as e:
+        except (TelegramNetworkError, TelegramBadRequest, FloodWaitError) as e:
             if attempt == max_attempts - 1:
                 logger.error(f"Max retries reached: {e}")
                 raise
             wait = delay * (2 ** attempt)
+            if isinstance(e, FloodWaitError):
+                wait = max(wait, e.seconds)
             logger.warning(f"API error on attempt {attempt + 1}: {e}. Retrying in {wait}s...")
             await asyncio.sleep(wait)
     raise Exception("Unexpected retry failure")
@@ -370,6 +372,31 @@ async def send_status_updates(db: aiosqlite.Connection):
             logger.error(f"Error in status updates: {e}")
         await asyncio.sleep(REPORT_STATUS_UPDATE_INTERVAL)
 
+async def validate_session_file(file_path: str) -> bool:
+    try:
+        async with TelegramClient(file_path, API_ID, API_HASH) as client:
+            await client.start()
+            return True
+    except Exception as e:
+        logger.error(f"Session validation failed for {file_path}: {e}")
+        return False
+
+async def session_health_check(db: aiosqlite.Connection):
+    while True:
+        try:
+            sessions = [f for f in os.listdir(SESSION_DIR) if f.endswith(ALLOWED_SESSION_EXTENSION)]
+            for session in sessions:
+                file_path = os.path.join(SESSION_DIR, session)
+                if not await validate_session_file(file_path):
+                    os.remove(file_path)
+                    async with db.cursor() as cursor:
+                        await cursor.execute("DELETE FROM session_stats WHERE session_hash = ?", (session,))
+                        await db.commit()
+                    logger.info(f"Removed invalid session {session}")
+        except Exception as e:
+            logger.error(f"Error in session health check: {e}")
+        await asyncio.sleep(SESSION_HEALTH_CHECK_INTERVAL)
+
 async def report_fraud_to_telegram(db: aiosqlite.Connection):
     while True:
         try:
@@ -410,11 +437,12 @@ async def report_fraud_to_telegram(db: aiosqlite.Connection):
                         async with TelegramClient(session_path, API_ID, API_HASH) as client:
                             await client.start()
                             try:
-                                await client(ReportSpamRequest(peer=InputPeerUser(user_id=fraud_user_id, access_hash=0)))
+                                # Report as spam or fraud
                                 await client(ReportRequest(
                                     peer=InputPeerUser(user_id=fraud_user_id, access_hash=0),
-                                    message=f"Fraud Report ID: {report_id}\nUsername: {fraud_username}\nDetails: {fraud_detail}",
-                                    reason="spam"
+                                    id=[],
+                                    reason='spam',
+                                    message=f"Fraud Report ID: {report_id}\nUsername: {fraud_username}\nDetails: {fraud_detail}"
                                 ))
                                 async with db.cursor() as cursor:
                                     await cursor.execute(
@@ -437,8 +465,11 @@ async def report_fraud_to_telegram(db: aiosqlite.Connection):
                                     await delete_message_later(msg)
                                 except TelegramBadRequest as e:
                                     logger.warning(f"Failed to notify user {user_id}: {e}")
-                            except Exception as e:
+                            except (PeerIdInvalidError, ValueError) as e:
                                 logger.error(f"Failed to report user {fraud_user_id} for report {report_id}: {e}")
+                            except FloodWaitError as e:
+                                logger.warning(f"Flood wait for session {session_file}: {e.seconds}s")
+                                await asyncio.sleep(e.seconds)
                     except Exception as e:
                         logger.error(f"Failed to use session {session_file} for report {report_id}: {e}")
                     await update_session_stats(db, session_file, success)
@@ -784,16 +815,12 @@ async def handle_session_upload(msg: Message, state: FSMContext, db: aiosqlite.C
     file_path = os.path.join(SESSION_DIR, hashed_name)
     await msg.document.download(destination_file=file_path)
 
-    try:
-        async with TelegramClient(file_path, API_ID, API_HASH) as client:
-            await client.start()
-            logger.info(f"Session file {hashed_name} validated")
-    except Exception as e:
+    if not await validate_session_file(file_path):
         os.remove(file_path)
         sent_msg = await safe_message_action(msg, "answer", "⚠️ Invalid session file. Upload a valid .session.")
         await delete_message_later(msg)
         await delete_message_later(sent_msg)
-        logger.error(f"Failed to validate session from admin {msg.from_user.id}: {e}")
+        logger.error(f"Failed to validate session from admin {msg.from_user.id}")
         return
 
     async with db.cursor() as cursor:
@@ -1299,6 +1326,7 @@ async def main():
         asyncio.create_task(check_fraud_username_changes(db))
         asyncio.create_task(send_status_updates(db))
         asyncio.create_task(report_fraud_to_telegram(db))
+        asyncio.create_task(session_health_check(db))
         await dp.start_polling(bot, db=db)
     except Exception as e:
         logger.critical(f"Bot crashed: {e}")
