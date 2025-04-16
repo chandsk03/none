@@ -7,6 +7,7 @@ import hashlib
 import json
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
+import importlib.metadata
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.types import Message, CallbackQuery, FSInputFile
@@ -14,7 +15,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import CommandStart, Command, StateFilter, CommandCancel
+from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.exceptions import TelegramNetworkError, TelegramBadRequest
 from aiogram.client.default import DefaultBotProperties
 from telethon.sync import TelegramClient
@@ -24,6 +25,15 @@ from telethon.tl.types import InputPeerUser
 import re
 import aiosqlite
 from functools import lru_cache
+
+# --- Version Check ---
+try:
+    aiogram_version = importlib.metadata.version("aiogram")
+    if tuple(map(int, aiogram_version.split('.'))) < (3, 7, 0):
+        logging.warning(f"aiogram version {aiogram_version} detected. Recommend upgrading to >=3.7.0 for full compatibility.")
+except importlib.metadata.PackageNotFoundError:
+    logging.error("aiogram not installed. Please install with 'pip install aiogram>=3.7.0'.")
+    exit(1)
 
 # --- Config ---
 API_ID = 25781839
@@ -240,8 +250,8 @@ async def increment_session_limit(db: aiosqlite.Connection, admin_id: int):
 async def update_session_stats(db: aiosqlite.Connection, session_hash: str, success: bool):
     async with db.cursor() as cursor:
         await cursor.execute(
-            "INSERT OR IGNORE INTO session_stats (session_hash, last_used, use_count, success_count, failure_count) "
-            "VALUES (?, ?, 0, 0, 0)",
+            "INSERT OR IGNORE INTO session_stats (session_hash, last_used, use_count) "
+            "VALUES (?, ?, 0)",
             (session_hash, datetime.now())
         )
         if success:
@@ -317,7 +327,7 @@ async def check_fraud_username_changes(db: aiosqlite.Connection):
                         try:
                             msg = await bot.send_message(
                                 user_id,
-                                "🚨 Username change detected. Fraudulent activities are under investigation."
+                                "🚨 Username change detected. Under investigation."
                             )
                             await delete_message_later(msg, delay=600)
                             logger.info(f"Sent warning to user {user_id} ({current_username})")
@@ -326,7 +336,7 @@ async def check_fraud_username_changes(db: aiosqlite.Connection):
                 except TelegramBadRequest as e:
                     logger.warning(f"Failed to fetch chat for user {user_id}: {e}")
         except Exception as e:
-            logger.error(f"Error in username change check: {e}")
+            logger.error(f"Error in username check: {e}")
         await asyncio.sleep(USERNAME_CHECK_INTERVAL)
 
 async def send_status_updates(db: aiosqlite.Connection):
@@ -343,8 +353,8 @@ async def send_status_updates(db: aiosqlite.Connection):
                         user_id,
                         f"📢 <b>Report Update</b> | ID: {report_id}\n"
                         f"Status: <b>{status}</b>\n"
-                        f"Admin Notes: {admin_notes or 'None'}\n\n"
-                        "Thank you for your contribution!"
+                        f"Notes: {admin_notes or 'None'}\n\n"
+                        "Thanks for your help!"
                     )
                     async with db.cursor() as cursor:
                         await cursor.execute(
@@ -353,11 +363,11 @@ async def send_status_updates(db: aiosqlite.Connection):
                         )
                         await db.commit()
                     await delete_message_later(msg)
-                    logger.info(f"Sent status update for report {report_id} to user {user_id}")
+                    logger.info(f"Sent update for report {report_id} to user {user_id}")
                 except TelegramBadRequest as e:
-                    logger.warning(f"Failed to send status update to user {user_id}: {e}")
+                    logger.warning(f"Failed to send update to user {user_id}: {e}")
         except Exception as e:
-            logger.error(f"Error in status update task: {e}")
+            logger.error(f"Error in status updates: {e}")
         await asyncio.sleep(REPORT_STATUS_UPDATE_INTERVAL)
 
 async def report_fraud_to_telegram(db: aiosqlite.Connection):
@@ -365,19 +375,33 @@ async def report_fraud_to_telegram(db: aiosqlite.Connection):
         try:
             async with db.cursor() as cursor:
                 await cursor.execute(
+                    "SELECT session_hash, failure_count FROM session_stats ORDER BY failure_count ASC, last_used DESC"
+                )
+                session_stats = await cursor.fetchall()
+                session_priority = [s[0] for s in session_stats if s[0] in os.listdir(SESSION_DIR)]
+                if not session_priority:
+                    session_priority = [f for f in os.listdir(SESSION_DIR) if f.endswith(ALLOWED_SESSION_EXTENSION)]
+            
+            if not session_priority:
+                logger.warning("No valid sessions available for fraud reporting")
+                await asyncio.sleep(FRAUD_REPORT_INTERVAL)
+                continue
+
+            async with db.cursor() as cursor:
+                await cursor.execute(
                     "SELECT r.report_id, r.fraud_user_id, r.fraud_username, r.fraud, r.photo_id "
                     "FROM reports r WHERE r.telegram_reported = 0 AND r.fraud_user_id IS NOT NULL LIMIT 5"
                 )
                 reports = await cursor.fetchall()
             
-            session_files = [f for f in os.listdir(SESSION_DIR) if f.endswith(ALLOWED_SESSION_EXTENSION)]
-            if not reports or not session_files:
+            if not reports:
                 await asyncio.sleep(FRAUD_REPORT_INTERVAL)
                 continue
 
             tasks = []
             for report_id, fraud_user_id, fraud_username, fraud_detail, photo_id in reports:
-                session_file = random.choice(session_files)
+                session_file = session_priority.pop(0) if session_priority else random.choice(session_priority)
+                session_priority.append(session_file)  # Rotate back
                 session_path = os.path.join(SESSION_DIR, session_file)
                 
                 async def process_report():
@@ -408,7 +432,7 @@ async def report_fraud_to_telegram(db: aiosqlite.Connection):
                                     msg = await bot.send_message(
                                         user_id,
                                         f"📢 <b>Update on Report {report_id}</b>\n"
-                                        "Action has been taken. Thank you for helping keep Telegram safe!"
+                                        "Action taken. Thanks for keeping Telegram safe!"
                                     )
                                     await delete_message_later(msg)
                                 except TelegramBadRequest as e:
@@ -423,7 +447,7 @@ async def report_fraud_to_telegram(db: aiosqlite.Connection):
 
             await asyncio.gather(*tasks, return_exceptions=True)
         except Exception as e:
-            logger.error(f"Error in fraud reporting task: {e}")
+            logger.error(f"Error in fraud reporting: {e}")
         await asyncio.sleep(FRAUD_REPORT_INTERVAL)
 
 # --- Analytics ---
@@ -525,17 +549,17 @@ def session_manage_buttons(sessions: List[str]) -> InlineKeyboardMarkup:
 async def handle_start(msg: Message, state: FSMContext):
     welcome_text = (
         f"👋 Hello <b>{msg.from_user.full_name}</b>! Welcome to the Fraud Report Bot.\n\n"
-        "🔍 Report scams safely with 'Report Fraud'.\n"
-        "📜 Track your reports with 'My Reports'.\n"
-        "ℹ️ Need help? Tap 'Help'.\n\n"
-        "Let's make Telegram safer together! 😊"
+        "🔍 Report scams with 'Report Fraud'.\n"
+        "📜 Track reports with 'My Reports'.\n"
+        "ℹ️ Get help with 'Help'.\n\n"
+        "Let's keep Telegram safe! 😊"
     )
     sent_msg = await safe_message_action(msg, "answer", welcome_text, reply_markup=start_buttons())
     await delete_message_later(msg)
     await delete_message_later(sent_msg)
     logger.info(f"User {msg.from_user.id} started bot")
 
-@dp.message(CommandCancel(), StateFilter(ReportStates, AdminReviewStates))
+@dp.message(Command("cancel"), StateFilter(ReportStates, AdminReviewStates))
 async def handle_cancel(msg: Message, state: FSMContext):
     sent_msg = await safe_message_action(
         msg, "answer",
@@ -552,10 +576,10 @@ async def handle_admin(msg: Message):
     admin_text = (
         "🛠️ <b>Admin Dashboard</b>\n\n"
         "Choose an action:\n"
-        "- 📋 Review pending reports\n"
-        "- 📊 View analytics dashboard\n"
-        "- 📥 Manage session uploads\n"
-        "- 🗑️ Control active sessions"
+        "- 📋 Review reports\n"
+        "- 📊 View analytics\n"
+        "- 📥 Upload sessions\n"
+        "- 🗑️ Manage sessions"
     )
     sent_msg = await safe_message_action(msg, "answer", admin_text, reply_markup=admin_buttons())
     await delete_message_later(msg)
@@ -567,10 +591,10 @@ async def admin_menu(cb: CallbackQuery):
     admin_text = (
         "🛠️ <b>Admin Dashboard</b>\n\n"
         "Choose an action:\n"
-        "- 📋 Review pending reports\n"
-        "- 📊 View analytics dashboard\n"
-        "- 📥 Manage session uploads\n"
-        "- 🗑️ Control active sessions"
+        "- 📋 Review reports\n"
+        "- 📊 View analytics\n"
+        "- 📥 Upload sessions\n"
+        "- 🗑️ Manage sessions"
     )
     sent_msg = await safe_message_action(cb.message, "edit_text", admin_text, reply_markup=admin_buttons())
     await delete_message_later(sent_msg)
@@ -606,7 +630,7 @@ async def review_reports(cb: CallbackQuery, state: FSMContext, db: aiosqlite.Con
     if not reports:
         sent_msg = await safe_message_action(
             cb.message, "edit_text",
-            "🎉 No pending reports! You're all caught up.",
+            "🎉 No pending reports! All caught up.",
             reply_markup=admin_buttons()
         )
         await delete_message_later(sent_msg)
@@ -686,7 +710,7 @@ async def add_notes_prompt(cb: CallbackQuery, state: FSMContext):
     await delete_message_later(sent_msg)
     await state.update_data(report_id=report_id)
     await state.set_state(AdminReviewStates.add_notes)
-    logger.info(f"Admin {cb.from_user.id} prompted to add notes for report {report_id}")
+    logger.info(f"Admin {cb.from_user.id} prompted notes for report {report_id}")
 
 @dp.message(StateFilter(AdminReviewStates.add_notes))
 async def handle_notes(msg: Message, state: FSMContext, db: aiosqlite.Connection = None):
@@ -857,7 +881,7 @@ async def view_user_reports(cb: CallbackQuery, db: aiosqlite.Connection = None):
     if not reports:
         sent_msg = await safe_message_action(
             cb.message, "edit_text",
-            "📭 No reports submitted. Start one with 'Report Fraud'!",
+            "📭 No reports submitted. Start with 'Report Fraud'!",
             reply_markup=start_buttons()
         )
         await delete_message_later(sent_msg)
@@ -884,16 +908,16 @@ async def handle_help(cb: CallbackQuery):
         "ℹ️ <b>Fraud Report Guide</b>\n\n"
         "Here's how to use the bot:\n\n"
         "1. Tap 'Report Fraud' to start.\n"
-        "2. Solve a CAPTCHA to verify you're human.\n"
-        "3. Enter the fraudster's username (@username).\n"
-        "4. Describe the fraud (max 1000 chars).\n"
-        "5. Upload a JPG/PNG screenshot (max 10MB).\n"
-        "6. Provide your contact (username or phone).\n"
-        "7. Confirm and submit.\n\n"
-        "🔐 Your data is secure, shared only with moderators.\n"
-        "📜 Use 'My Reports' to check status.\n"
-        "❌ Cancel anytime with /cancel.\n\n"
-        "Questions? We're here to help! 😊"
+        "2. Solve a CAPTCHA to verify.\n"
+        "3. Enter fraudster's username (@username).\n"
+        "4. Describe fraud (max 1000 chars).\n"
+        "5. Upload JPG/PNG screenshot (max 10MB).\n"
+        "6. Provide contact (username or phone).\n"
+        "7. Confirm to submit.\n\n"
+        "🔐 Data is secure, shared only with moderators.\n"
+        "📜 Check 'My Reports' for status.\n"
+        "❌ Use /cancel to stop.\n\n"
+        "Need help? We're here! 😊"
     )
     sent_msg = await safe_message_action(
         cb.message, "edit_text",
@@ -924,7 +948,7 @@ async def handle_report_start(cb: CallbackQuery, state: FSMContext, db: aiosqlit
         if await cursor.fetchone():
             sent_msg = await safe_message_action(
                 cb.message, "edit_text",
-                "⚠️ You have a pending report. Wait for review.",
+                "⚠️ Pending report exists. Wait for review.",
                 reply_markup=start_buttons()
             )
             await delete_message_later(sent_msg)
@@ -936,7 +960,7 @@ async def handle_report_start(cb: CallbackQuery, state: FSMContext, db: aiosqlit
     sent_msg = await safe_message_action(
         cb.message, "edit_text",
         f"🔒 Solve CAPTCHA:\n<b>{num1} {op} {num2} = ?</b>\n\n"
-        "Type your answer or tap 'New CAPTCHA'.",
+        "Type answer or tap 'New CAPTCHA'.",
         reply_markup=captcha_buttons()
     )
     await delete_message_later(sent_msg, delay=CAPTCHA_DELETE_DELAY)
@@ -950,7 +974,7 @@ async def resend_captcha(cb: CallbackQuery, state: FSMContext):
     sent_msg = await safe_message_action(
         cb.message, "edit_text",
         f"🔒 New CAPTCHA:\n<b>{num1} {op} {num2} = ?</b>\n\n"
-        "Type your answer or tap 'New CAPTCHA'.",
+        "Type answer or tap 'New CAPTCHA'.",
         reply_markup=captcha_buttons()
     )
     await delete_message_later(sent_msg, delay=CAPTCHA_DELETE_DELAY)
@@ -982,7 +1006,7 @@ async def handle_captcha_answer(msg: Message, state: FSMContext):
         await state.update_data(captcha_answer=answer, captcha_attempts=captcha_attempts)
         sent_msg = await safe_message_action(
             msg, "answer",
-            f"⚠️ Enter a number. Try again:\n<b>{num1} {op} {num2} = ?</b>\n"
+            f"⚠️ Enter a number:\n<b>{num1} {op} {num2} = ?</b>\n"
             f"Attempts left: {MAX_CAPTCHA_ATTEMPTS - captcha_attempts}",
             reply_markup=captcha_buttons()
         )
@@ -1013,7 +1037,7 @@ async def handle_captcha_answer(msg: Message, state: FSMContext):
         await state.update_data(captcha_answer=answer, captcha_attempts=captcha_attempts)
         sent_msg = await safe_message_action(
             msg, "answer",
-            f"❌ Incorrect. Try again:\n<b>{num1} {op} {num2} = ?</b>\n"
+            f"❌ Incorrect:\n<b>{num1} {op} {num2} = ?</b>\n"
             f"Attempts left: {MAX_CAPTCHA_ATTEMPTS - captcha_attempts}",
             reply_markup=captcha_buttons()
         )
@@ -1026,7 +1050,7 @@ async def handle_fraud_username(msg: Message, state: FSMContext):
     if not validate_username(msg.text):
         sent_msg = await safe_message_action(
             msg, "answer",
-            "⚠️ Invalid username. Use @username format (e.g., @BadUser)."
+            "⚠️ Invalid username. Use @username format."
         )
         await delete_message_later(msg)
         await delete_message_later(sent_msg)
@@ -1042,7 +1066,7 @@ async def handle_fraud_username(msg: Message, state: FSMContext):
     await state.update_data(fraud_username=fraud_username, fraud_user_id=fraud_user_id)
     sent_msg = await safe_message_action(
         msg, "answer",
-        f"Got it. Describe the fraud (max {MAX_FRAUD_DETAIL_LENGTH} chars)."
+        f"Got it. Describe fraud (max {MAX_FRAUD_DETAIL_LENGTH} chars)."
     )
     await delete_message_later(msg)
     await delete_message_later(sent_msg)
@@ -1063,7 +1087,7 @@ async def handle_fraud_detail(msg: Message, state: FSMContext):
     await state.update_data(fraud_detail=msg.text)
     sent_msg = await safe_message_action(
         msg, "answer",
-        "Thanks! Upload a JPG/PNG image as proof (max 10MB)."
+        "Thanks! Upload JPG/PNG proof (max 10MB)."
     )
     await delete_message_later(msg)
     await delete_message_later(sent_msg)
@@ -1073,7 +1097,7 @@ async def handle_fraud_detail(msg: Message, state: FSMContext):
 @dp.message(StateFilter(ReportStates.proof))
 async def handle_proof(msg: Message, state: FSMContext):
     if not msg.photo:
-        sent_msg = await safe_message_action(msg, "answer", "⚠️ Send a JPG/PNG image.")
+        sent_msg = await safe_message_action(msg, "answer", "⚠️ Send JPG/PNG image.")
         await delete_message_later(msg)
         await delete_message_later(sent_msg)
         logger.warning(f"User {msg.from_user.id} sent non-image")
@@ -1082,7 +1106,7 @@ async def handle_proof(msg: Message, state: FSMContext):
     photo = msg.photo[-1]
     file_info = await bot.get_file(photo.file_id)
     if file_info.file_size > MAX_IMAGE_SIZE:
-        sent_msg = await safe_message_action(msg, "answer", "⚠️ Image too large. Use under 10MB.")
+        sent_msg = await safe_message_action(msg, "answer", "⚠️ Image too large. Use <10MB.")
         await delete_message_later(msg)
         await delete_message_later(sent_msg)
         logger.warning(f"User {msg.from_user.id} sent oversized image")
@@ -1099,7 +1123,7 @@ async def handle_proof(msg: Message, state: FSMContext):
     await state.update_data(proof_id=photo.file_id)
     sent_msg = await safe_message_action(
         msg, "answer",
-        "Great! Provide your contact (username or phone)."
+        "Great! Provide contact (username or phone)."
     )
     await delete_message_later(msg)
     await delete_message_later(sent_msg)
@@ -1111,7 +1135,7 @@ async def handle_contact(msg: Message, state: FSMContext):
     if not validate_contact(msg.text):
         sent_msg = await safe_message_action(
             msg, "answer",
-            "⚠️ Invalid contact. Use @username or phone number."
+            "⚠️ Invalid contact. Use @username or phone."
         )
         await delete_message_later(msg)
         await delete_message_later(sent_msg)
@@ -1126,7 +1150,7 @@ async def handle_contact(msg: Message, state: FSMContext):
     fraud_username = data.get("fraud_username", "Unknown")
     preview = (
         f"<b>Report Preview</b>\n\n"
-        f"<b>Your Username:</b> @{msg.from_user.username or 'NoUsername'}\n"
+        f"<b>Username:</b> @{msg.from_user.username or 'NoUsername'}\n"
         f"<b>Fraudster:</b> {fraud_username}\n"
         f"<b>Details:</b> {data.get('fraud_detail', '')[:100]}...\n"
         f"<b>Contact:</b> {data.get('contact', '')}\n\n"
@@ -1196,7 +1220,7 @@ async def finish_report(cb: CallbackQuery, state: FSMContext, db: aiosqlite.Conn
         await delete_message_later(sent_msg, delay=86400)
     sent_msg = await safe_message_action(
         cb.message, "answer",
-        "✅ Report submitted! We'll update you soon. Thanks for fighting fraud! 😊",
+        "✅ Report submitted! We'll update you soon. Thanks! 😊",
         reply_markup=start_buttons()
     )
     await delete_message_later(sent_msg)
@@ -1221,7 +1245,7 @@ async def finish_report(cb: CallbackQuery, state: FSMContext, db: aiosqlite.Conn
 async def cancel_report(cb: CallbackQuery, state: FSMContext):
     sent_msg = await safe_message_action(
         cb.message, "answer",
-        "❌ Report cancelled. Start anew anytime! 😊",
+        "❌ Report cancelled. Start anew! 😊",
         reply_markup=start_buttons()
     )
     await delete_message_later(sent_msg)
@@ -1233,7 +1257,7 @@ async def handle_unexpected_input(msg: Message, state: FSMContext):
     current_state = await state.get_state()
     sent_msg = await safe_message_action(
         msg, "answer",
-        f"⚠️ Unexpected input in {current_state or 'unknown'} state. Follow prompts or use /cancel."
+        f"⚠️ Unexpected input in {current_state or 'unknown'} state. Follow prompts or /cancel."
     )
     await delete_message_later(msg)
     await delete_message_later(sent_msg)
