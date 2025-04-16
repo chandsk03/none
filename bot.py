@@ -20,6 +20,7 @@ BOT_TOKEN = "7614305417:AAGaPSv_bgfiJ6f_gMLhXfL0HOpaAfYsCEI"
 ADMIN_IDS = [7584086775]
 RATE_LIMIT = 5  # Max conversions per user per hour
 RATE_LIMIT_WINDOW = 3600  # 1 hour in seconds
+FILE_RETENTION_HOURS = 24  # Clean up files older than 24 hours
 
 # Setup logging
 logging.basicConfig(
@@ -44,6 +45,7 @@ def init_db():
                      id INTEGER PRIMARY KEY AUTOINCREMENT,
                      user_id INTEGER,
                      session_file TEXT,
+                     short_session_id TEXT,
                      session_string TEXT,
                      created_at TEXT
                      )''')
@@ -96,8 +98,8 @@ def get_short_session_id(session_file):
     return hashlib.md5(session_file.encode()).hexdigest()[:8]
 
 # Inline buttons for format selection
-def get_format_buttons(user_id, session_id, display_file):
-    callback_base = f"convert_{{}}_{user_id}_{session_id}"
+def get_format_buttons(user_id, short_session_id, display_file):
+    callback_base = f"convert_{{}}_{user_id}_{short_session_id}"
     buttons = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("JSON", callback_data=callback_base.format("json")),
@@ -112,7 +114,7 @@ def get_format_buttons(user_id, session_id, display_file):
     for row in buttons.inline_keyboard:
         for button in row:
             if len(button.callback_data.encode()) > 64:
-                logger.error(f"Callback data too long: {button.callback_data}")
+                logger.error(f"Callback data too long: {button.callback_data} ({len(button.callback_data.encode())} bytes)")
                 return None
     return buttons
 
@@ -140,7 +142,10 @@ async def help_command(client, message):
         "3. Receive the converted file.\n\n"
         "Supported formats: JSON, TDATA, TXT, StringSession.\n"
         f"Rate limit: {RATE_LIMIT} conversions per hour.\n"
-        "Contact admin for support."
+        "Contact admin for support.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Help", callback_data="help")]
+        ])
     )
 
 # Admin status command
@@ -175,15 +180,28 @@ async def cleanup_command(client, message):
     try:
         files = os.listdir(SESSION_DIR)
         deleted = 0
+        cutoff = datetime.now() - timedelta(hours=FILE_RETENTION_HOURS)
         for file in files:
             file_path = os.path.join(SESSION_DIR, file)
             if os.path.isfile(file_path):
-                os.remove(file_path)
-                deleted += 1
-        await message.reply_text(f"Cleaned up {deleted} files from session directory.")
+                file_mtime = datetime.fromtimestamp(os.path.getmtime(file_path))
+                if file_mtime < cutoff:
+                    os.remove(file_path)
+                    deleted += 1
+        await message.reply_text(f"Cleaned up {deleted} old files from session directory.")
     except Exception as e:
         logger.error(f"Error during cleanup: {e}")
         await message.reply_text("Failed to clean up files.")
+
+# Validate session file content
+def validate_session_file(file_path):
+    try:
+        with open(file_path, "r") as f:
+            content = f.read().strip()
+        return len(content) > 100 and re.match(r'^[A-Za-z0-9+/=]+$', content)
+    except Exception as e:
+        logger.error(f"Error validating session file {file_path}: {e}")
+        return False
 
 # Handle document (session file)
 @app.on_message(filters.document & filters.private)
@@ -193,22 +211,28 @@ async def handle_document(client, message):
     unique_id = str(uuid4())
     session_file = f"{unique_id}_{file_name}"
     file_path = os.path.join(SESSION_DIR, f"{user_id}_{session_file}")
+    short_session_id = get_short_session_id(session_file)
 
     try:
         logger.info(f"Received document from user {user_id}: {file_name}")
         # Download the file
         await message.download(file_path)
 
+        # Validate session file
+        if not validate_session_file(file_path):
+            await message.reply_text("Invalid session file. Please upload a valid Telethon .session file.")
+            os.remove(file_path)
+            return
+
         # Store in database
         with sqlite3.connect("sessions.db") as conn:
             c = conn.cursor()
-            c.execute("INSERT INTO sessions (user_id, session_file, created_at) VALUES (?, ?, ?)",
-                      (user_id, session_file, datetime.now().isoformat()))
+            c.execute("INSERT INTO sessions (user_id, session_file, short_session_id, created_at) VALUES (?, ?, ?, ?)",
+                      (user_id, session_file, short_session_id, datetime.now().isoformat()))
             session_id = c.lastrowid
             conn.commit()
 
-        # Generate short session ID
-        short_session_id = get_short_session_id(session_file)
+        logger.info(f"Stored session {session_file} with short_session_id {short_session_id}")
 
         # Send format selection buttons
         buttons = get_format_buttons(user_id, short_session_id, file_name)
@@ -222,6 +246,9 @@ async def handle_document(client, message):
     except Exception as e:
         logger.error(f"Error handling document for user {user_id}: {e}")
         await message.reply_text("Failed to process the file. Please try again.")
+    finally:
+        # Do not delete the file here; delete after conversion
+        pass
 
 # Handle text (session string)
 @app.on_message(filters.text & filters.private)
@@ -235,6 +262,7 @@ async def handle_text(client, message):
             unique_id = str(uuid4())
             session_file = f"{unique_id}_session.string"
             file_path = os.path.join(SESSION_DIR, f"{user_id}_{session_file}")
+            short_session_id = get_short_session_id(session_file)
 
             logger.info(f"Received session string from user {user_id}")
 
@@ -245,13 +273,12 @@ async def handle_text(client, message):
             # Store in database
             with sqlite3.connect("sessions.db") as conn:
                 c = conn.cursor()
-                c.execute("INSERT INTO sessions (user_id, session_file, session_string, created_at) VALUES (?, ?, ?, ?)",
-                          (user_id, session_file, session_string, datetime.now().isoformat()))
+                c.execute("INSERT INTO sessions (user_id, session_file, short_session_id, session_string, created_at) VALUES (?, ?, ?, ?, ?)",
+                          (user_id, session_file, short_session_id, session_string, datetime.now().isoformat()))
                 session_id = c.lastrowid
                 conn.commit()
 
-            # Generate short session ID
-            short_session_id = get_short_session_id(session_file)
+            logger.info(f"Stored session {session_file} with short_session_id {short_session_id}")
 
             # Send format selection buttons
             buttons = get_format_buttons(user_id, short_session_id, "session.string")
@@ -372,6 +399,22 @@ async def handle_callback(client, callback_query):
     user_id = callback_query.from_user.id
 
     try:
+        if data == "help":
+            await callback_query.message.edit_text(
+                "📚 **Help**\n"
+                "1. Send a `.session` file, tdata folder, or a session string.\n"
+                "2. Choose the format to convert to using inline buttons.\n"
+                "3. Receive the converted file.\n\n"
+                "Supported formats: JSON, TDATA, TXT, StringSession.\n"
+                f"Rate limit: {RATE_LIMIT} conversions per hour.\n"
+                "Contact admin for support.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Help", callback_data="help")]
+                ])
+            )
+            await callback_query.answer()
+            return
+
         if not data.startswith("convert_"):
             await callback_query.answer("Invalid selection.")
             return
@@ -398,11 +441,13 @@ async def handle_callback(client, callback_query):
         # Find the actual session file from the database
         with sqlite3.connect("sessions.db") as conn:
             c = conn.cursor()
-            c.execute("SELECT session_file FROM sessions WHERE user_id = ? AND ? LIKE '%' || session_file",
-                      (user_id, f"%{short_session_id}%"))
+            c.execute("SELECT session_file FROM sessions WHERE user_id = ? AND short_session_id = ?",
+                      (user_id, short_session_id))
             result = c.fetchone()
+            logger.info(f"Session lookup for user {user_id}, short_session_id {short_session_id}: {result}")
             if not result:
                 await callback_query.answer("Session not found.")
+                await callback_query.message.edit_text("Session not found. Please upload the file again.")
                 return
             session_file = result[0]
 
@@ -434,24 +479,24 @@ async def handle_callback(client, callback_query):
                 os.remove(output_path)
             except Exception as e:
                 logger.error(f"Failed to delete file {output_path}: {e}")
+
+            # Clean up original session file
+            input_path = os.path.join(SESSION_DIR, f"{user_id}_{session_file}")
+            if os.path.exists(input_path):
+                try:
+                    os.remove(input_path)
+                except Exception as e:
+                    logger.error(f"Failed to delete original file {input_path}: {e}")
         else:
             await callback_query.message.edit_text(
                 f"Conversion failed: {output_path}",
                 reply_markup=get_format_buttons(user_id, short_session_id, session_file.split("_", 1)[-1])
             )
-
-        # Clean up original session file
-        input_path = os.path.join(SESSION_DIR, f"{user_id}_{session_file}")
-        if os.path.exists(input_path):
-            try:
-                os.remove(input_path)
-            except Exception as e:
-                logger.error(f"Failed to delete original file {input_path}: {e}")
     except Exception as e:
         logger.error(f"Error in callback for user {user_id}: {e}")
         await callback_query.message.edit_text(
             f"Error during conversion: {str(e)}",
-            reply_markup=get_format_buttons(user_id, short_session_id, session_file.split("_", 1)[-1])
+            reply_markup=get_format_buttons(user_id, short_session_id, session_file.split("_", 1)[-1] if 'session_file' in locals() else "unknown")
         )
 
 # Main function to run the bot
