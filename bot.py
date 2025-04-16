@@ -118,6 +118,19 @@ def get_format_buttons(user_id, short_session_id, display_file):
                 return None
     return buttons
 
+# Inline buttons for main menu
+def get_main_menu_buttons():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Help", callback_data="help")]
+    ])
+
+# Inline buttons for help menu
+def get_help_menu_buttons():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Help", callback_data="help")],
+        [InlineKeyboardButton("Back", callback_data="back")]
+    ])
+
 # Start command
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
@@ -126,9 +139,7 @@ async def start(client, message):
         "Welcome to the Session Converter Bot! 📂\n"
         "Send a session file (.session, tdata folder, or string) to convert it to JSON, TDATA, TXT, or StringSession.\n"
         "Use /help for more info.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("Help", callback_data="help")]
-        ])
+        reply_markup=get_main_menu_buttons()
     )
 
 # Help command
@@ -143,9 +154,7 @@ async def help_command(client, message):
         "Supported formats: JSON, TDATA, TXT, StringSession.\n"
         f"Rate limit: {RATE_LIMIT} conversions per hour.\n"
         "Contact admin for support.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("Help", callback_data="help")]
-        ])
+        reply_markup=get_help_menu_buttons()
     )
 
 # Admin status command
@@ -196,9 +205,14 @@ async def cleanup_command(client, message):
 # Validate session file content
 def validate_session_file(file_path):
     try:
-        with open(file_path, "r") as f:
-            content = f.read().strip()
-        return len(content) > 100 and re.match(r'^[A-Za-z0-9+/=]+$', content)
+        # Telethon .session files are SQLite databases
+        with sqlite3.connect(file_path) as conn:
+            c = conn.cursor()
+            # Check for 'sessions' table, typical for Telethon
+            c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'")
+            if c.fetchone():
+                return True
+        return False
     except Exception as e:
         logger.error(f"Error validating session file {file_path}: {e}")
         return False
@@ -221,7 +235,8 @@ async def handle_document(client, message):
         # Validate session file
         if not validate_session_file(file_path):
             await message.reply_text("Invalid session file. Please upload a valid Telethon .session file.")
-            os.remove(file_path)
+            if os.path.exists(file_path):
+                os.remove(file_path)
             return
 
         # Store in database
@@ -246,9 +261,11 @@ async def handle_document(client, message):
     except Exception as e:
         logger.error(f"Error handling document for user {user_id}: {e}")
         await message.reply_text("Failed to process the file. Please try again.")
-    finally:
-        # Do not delete the file here; delete after conversion
-        pass
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception as e:
+                logger.error(f"Failed to delete file {file_path}: {e}")
 
 # Handle text (session string)
 @app.on_message(filters.text & filters.private)
@@ -303,11 +320,7 @@ async def convert_to_json(session_file, user_id):
     try:
         logger.info(f"Converting to JSON for user {user_id}: {session_file}")
         # Initialize Telethon client to extract session data
-        async with TelegramClient(StringSession(), API_ID, API_HASH) as client:
-            with open(input_path, "r") as f:
-                session_string = f.read().strip()
-            client.session.load_session(StringSession(session_string))
-
+        async with TelegramClient(input_path, API_ID, API_HASH) as client:
             # Extract session data
             session_data = {
                 "dc_id": client.session.dc_id,
@@ -383,8 +396,8 @@ async def convert_to_string(session_file, user_id):
 
     try:
         logger.info(f"Converting to StringSession for user {user_id}: {session_file}")
-        with open(input_path, "r") as f:
-            session_string = f.read().strip()
+        async with TelegramClient(input_path, API_ID, API_HASH) as client:
+            session_string = StringSession.save(client.session)
         with open(output_path, "w") as f:
             f.write(session_string)
         return output_path
@@ -400,6 +413,7 @@ async def handle_callback(client, callback_query):
 
     try:
         if data == "help":
+            logger.info(f"Help button pressed by user {user_id}")
             await callback_query.message.edit_text(
                 "📚 **Help**\n"
                 "1. Send a `.session` file, tdata folder, or a session string.\n"
@@ -408,9 +422,18 @@ async def handle_callback(client, callback_query):
                 "Supported formats: JSON, TDATA, TXT, StringSession.\n"
                 f"Rate limit: {RATE_LIMIT} conversions per hour.\n"
                 "Contact admin for support.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Help", callback_data="help")]
-                ])
+                reply_markup=get_help_menu_buttons()
+            )
+            await callback_query.answer()
+            return
+
+        if data == "back":
+            logger.info(f"Back button pressed by user {user_id}")
+            await callback_query.message.edit_text(
+                "Welcome to the Session Converter Bot! 📂\n"
+                "Send a session file (.session, tdata folder, or string) to convert it to JSON, TDATA, TXT, or StringSession.\n"
+                "Use /help for more info.",
+                reply_markup=get_main_menu_buttons()
             )
             await callback_query.answer()
             return
@@ -451,7 +474,9 @@ async def handle_callback(client, callback_query):
                 return
             session_file = result[0]
 
-        await callback_query.message.edit_text("Converting... Please wait.")
+        # Check if message needs updating to avoid MESSAGE_NOT_MODIFIED
+        if callback_query.message.text != "Converting... Please wait.":
+            await callback_query.message.edit_text("Converting... Please wait.")
 
         # Perform conversion
         output_path = None
@@ -470,7 +495,7 @@ async def handle_callback(client, callback_query):
 
             # Send converted file
             await callback_query.message.reply_document(
-                document=output_path,
+                document= output_path,
                 caption=f"Converted to {format_type.upper()}",
                 reply_markup=get_format_buttons(user_id, short_session_id, session_file.split("_", 1)[-1])
             )
@@ -494,10 +519,20 @@ async def handle_callback(client, callback_query):
             )
     except Exception as e:
         logger.error(f"Error in callback for user {user_id}: {e}")
-        await callback_query.message.edit_text(
-            f"Error during conversion: {str(e)}",
-            reply_markup=get_format_buttons(user_id, short_session_id, session_file.split("_", 1)[-1] if 'session_file' in locals() else "unknown")
-        )
+        error_message = f"Error during conversion: {str(e)}"
+        try:
+            # Fallback to safe reply if edit fails
+            if callback_query.message.text != error_message:
+                await callback_query.message.edit_text(
+                    error_message,
+                    reply_markup=get_main_menu_buttons()
+                )
+        except Exception as edit_e:
+            logger.error(f"Failed to edit message for user {user_id}: {edit_e}")
+            await callback_query.message.reply_text(
+                error_message,
+                reply_markup=get_main_menu_buttons()
+            )
 
 # Main function to run the bot
 if __name__ == "__main__":
