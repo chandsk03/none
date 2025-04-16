@@ -6,12 +6,15 @@ import asyncio
 import sqlite3
 import re
 import hashlib
+import signal
 from datetime import datetime, timedelta
 from uuid import uuid4
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import MessageNotModified
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon.sessions.sqlite import SQLiteSession
 
 # --- Config ---
 API_ID = 25781839
@@ -108,9 +111,10 @@ def get_format_buttons(user_id, short_session_id, display_file):
         [
             InlineKeyboardButton("TXT", callback_data=callback_base.format("txt")),
             InlineKeyboardButton("StringSession", callback_data=callback_base.format("string"))
-        ]
+        ],
+        [InlineKeyboardButton("Back", callback_data="back")]
     ])
-    # Validate callback data length
+    # Validate callback data length (Telegram limit: 64 bytes)
     for row in buttons.inline_keyboard:
         for button in row:
             if len(button.callback_data.encode()) > 64:
@@ -131,13 +135,27 @@ def get_help_menu_buttons():
         [InlineKeyboardButton("Back", callback_data="back")]
     ])
 
+# Validate session file content
+def validate_session_file(file_path):
+    try:
+        # Telethon .session files are SQLite databases
+        with sqlite3.connect(file_path) as conn:
+            c = conn.cursor()
+            c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'")
+            if c.fetchone():
+                return True
+        return False
+    except Exception as e:
+        logger.error(f"Error validating session file {file_path}: {e}")
+        return False
+
 # Start command
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
     logger.info(f"Start command received from user {message.from_user.id}")
     await message.reply_text(
         "Welcome to the Session Converter Bot! 📂\n"
-        "Send a session file (.session, tdata folder, or string) to convert it to JSON, TDATA, TXT, or StringSession.\n"
+        "Send a Telethon .session file to convert it to JSON, TDATA, TXT, or StringSession for use in Telegram Desktop.\n"
         "Use /help for more info.",
         reply_markup=get_main_menu_buttons()
     )
@@ -148,10 +166,14 @@ async def help_command(client, message):
     logger.info(f"Help command received from user {message.from_user.id}")
     await message.reply_text(
         "📚 **Help**\n"
-        "1. Send a `.session` file, tdata folder, or a session string.\n"
-        "2. Choose the format to convert to using inline buttons.\n"
+        "1. Send a Telethon `.session` file.\n"
+        "2. Choose a format (JSON, TDATA, TXT, StringSession) using inline buttons.\n"
         "3. Receive the converted file.\n\n"
-        "Supported formats: JSON, TDATA, TXT, StringSession.\n"
+        "**Using Converted Files in Telegram Desktop**:\n"
+        "- **TDATA**: Extract the zip to a folder and point Telegram Desktop to it.\n"
+        "- **StringSession**: Use in a Telethon script to log in.\n"
+        "- **JSON**: For developers to reconstruct sessions programmatically.\n"
+        "- **TXT**: Raw session file copy.\n\n"
         f"Rate limit: {RATE_LIMIT} conversions per hour.\n"
         "Contact admin for support.",
         reply_markup=get_help_menu_buttons()
@@ -202,26 +224,15 @@ async def cleanup_command(client, message):
         logger.error(f"Error during cleanup: {e}")
         await message.reply_text("Failed to clean up files.")
 
-# Validate session file content
-def validate_session_file(file_path):
-    try:
-        # Telethon .session files are SQLite databases
-        with sqlite3.connect(file_path) as conn:
-            c = conn.cursor()
-            # Check for 'sessions' table, typical for Telethon
-            c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'")
-            if c.fetchone():
-                return True
-        return False
-    except Exception as e:
-        logger.error(f"Error validating session file {file_path}: {e}")
-        return False
-
 # Handle document (session file)
 @app.on_message(filters.document & filters.private)
 async def handle_document(client, message):
     user_id = message.from_user.id
     file_name = message.document.file_name
+    if not file_name.endswith(".session"):
+        await message.reply_text("Please upload a valid Telethon .session file.")
+        return
+
     unique_id = str(uuid4())
     session_file = f"{unique_id}_{file_name}"
     file_path = os.path.join(SESSION_DIR, f"{user_id}_{session_file}")
@@ -244,7 +255,6 @@ async def handle_document(client, message):
             c = conn.cursor()
             c.execute("INSERT INTO sessions (user_id, session_file, short_session_id, created_at) VALUES (?, ?, ?, ?)",
                       (user_id, session_file, short_session_id, datetime.now().isoformat()))
-            session_id = c.lastrowid
             conn.commit()
 
         logger.info(f"Stored session {session_file} with short_session_id {short_session_id}")
@@ -258,6 +268,8 @@ async def handle_document(client, message):
             )
         else:
             await message.reply_text("Error: Unable to generate conversion options. Please try again.")
+            if os.path.exists(file_path):
+                os.remove(file_path)
     except Exception as e:
         logger.error(f"Error handling document for user {user_id}: {e}")
         await message.reply_text("Failed to process the file. Please try again.")
@@ -292,7 +304,6 @@ async def handle_text(client, message):
                 c = conn.cursor()
                 c.execute("INSERT INTO sessions (user_id, session_file, short_session_id, session_string, created_at) VALUES (?, ?, ?, ?, ?)",
                           (user_id, session_file, short_session_id, session_string, datetime.now().isoformat()))
-                session_id = c.lastrowid
                 conn.commit()
 
             logger.info(f"Stored session {session_file} with short_session_id {short_session_id}")
@@ -306,6 +317,8 @@ async def handle_text(client, message):
                 )
             else:
                 await message.reply_text("Error: Unable to generate conversion options. Please try again.")
+                if os.path.exists(file_path):
+                    os.remove(file_path)
         else:
             await message.reply_text("Invalid session string. Please send a valid Telethon StringSession.")
     except Exception as e:
@@ -315,24 +328,24 @@ async def handle_text(client, message):
 # Conversion functions
 async def convert_to_json(session_file, user_id):
     input_path = os.path.join(SESSION_DIR, f"{user_id}_{session_file}")
-    output_path = os.path.join(SESSION_DIR, f"{user_id}_{uuid4()}_{session_file}.json")
+    output_path = os.path.join(SESSION_DIR, f"{user_id}_{uuid4()}_session.json")
 
     try:
         logger.info(f"Converting to JSON for user {user_id}: {session_file}")
-        # Initialize Telethon client to extract session data
-        async with TelegramClient(input_path, API_ID, API_HASH) as client:
-            # Extract session data
-            session_data = {
-                "dc_id": client.session.dc_id,
-                "server_address": client.session.server_address,
-                "port": client.session.port,
-                "auth_key": client.session.auth_key.key.hex() if client.session.auth_key else None,
-                "takeout_id": client.session.takeout_id
-            }
+        # Load session without connecting
+        session = SQLiteSession(input_path)
+        session_data = {
+            "dc_id": session.dc_id,
+            "server_address": session.server_address,
+            "port": session.port,
+            "auth_key": session.auth_key.key.hex() if session.auth_key else None,
+            "user_id": session.user_id,
+            "timestamp": session.timestamp.isoformat() if session.timestamp else None
+        }
 
-            # Save to JSON
-            with open(output_path, "w") as f:
-                json.dump(session_data, f, indent=4)
+        # Save to JSON
+        with open(output_path, "w") as f:
+            json.dump(session_data, f, indent=4)
 
         return output_path
     except Exception as e:
@@ -348,26 +361,33 @@ async def convert_to_tdata(session_file, user_id):
         logger.info(f"Converting to TDATA for user {user_id}: {session_file}")
         os.makedirs(output_dir, exist_ok=True)
 
-        # Enhanced TDATA structure
+        # Load session to extract data
+        session = SQLiteSession(input_path)
+        auth_key = session.auth_key.key if session.auth_key else b"\x00" * 256
+
+        # Create TDATA structure
         tdata_files = {
-            "key_data": input_path,  # Session key
+            "key_data": auth_key,
             "settings": json.dumps({
                 "version": "1.0",
-                "platform": "unknown",
+                "platform": "desktop",
                 "last_login": datetime.now().isoformat(),
-                "device_model": "BotConverter"
-            }),
-            "map": b"\x00" * 1024  # Placeholder for TDATA map
+                "device_model": "Telegram Desktop",
+                "dc_id": session.dc_id,
+                "server_address": session.server_address,
+                "port": session.port
+            }, indent=4),
+            "map": b"\x00" * 4096,  # Telegram Desktop expects a larger map file
+            "user": json.dumps({
+                "user_id": session.user_id,
+                "timestamp": session.timestamp.isoformat() if session.timestamp else None
+            }, indent=4)
         }
 
         for file_name, content in tdata_files.items():
             file_path = os.path.join(output_dir, file_name)
-            if isinstance(content, str) and os.path.exists(content):
-                with open(content, "rb") as src, open(file_path, "wb") as dst:
-                    dst.write(src.read())
-            else:
-                with open(file_path, "wb" if isinstance(content, bytes) else "w") as f:
-                    f.write(content)
+            with open(file_path, "wb" if isinstance(content, bytes) else "w") as f:
+                f.write(content)
 
         # Create zip archive
         shutil.make_archive(output_dir, "zip", output_dir)
@@ -379,7 +399,7 @@ async def convert_to_tdata(session_file, user_id):
 
 async def convert_to_txt(session_file, user_id):
     input_path = os.path.join(SESSION_DIR, f"{user_id}_{session_file}")
-    output_path = os.path.join(SESSION_DIR, f"{user_id}_{uuid4()}_{session_file}.txt")
+    output_path = os.path.join(SESSION_DIR, f"{user_id}_{uuid4()}_session.txt")
 
     try:
         logger.info(f"Converting to TXT for user {user_id}: {session_file}")
@@ -392,12 +412,12 @@ async def convert_to_txt(session_file, user_id):
 
 async def convert_to_string(session_file, user_id):
     input_path = os.path.join(SESSION_DIR, f"{user_id}_{session_file}")
-    output_path = os.path.join(SESSION_DIR, f"{user_id}_{uuid4()}_{session_file}_string.txt")
+    output_path = os.path.join(SESSION_DIR, f"{user_id}_{uuid4()}_session_string.txt")
 
     try:
         logger.info(f"Converting to StringSession for user {user_id}: {session_file}")
-        async with TelegramClient(input_path, API_ID, API_HASH) as client:
-            session_string = StringSession.save(client.session)
+        session = SQLiteSession(input_path)
+        session_string = StringSession.save(session)
         with open(output_path, "w") as f:
             f.write(session_string)
         return output_path
@@ -410,31 +430,55 @@ async def convert_to_string(session_file, user_id):
 async def handle_callback(client, callback_query):
     data = callback_query.data
     user_id = callback_query.from_user.id
+    session_file = None
+    short_session_id = None
 
     try:
         if data == "help":
             logger.info(f"Help button pressed by user {user_id}")
-            await callback_query.message.edit_text(
+            if callback_query.message.text != (
                 "📚 **Help**\n"
-                "1. Send a `.session` file, tdata folder, or a session string.\n"
-                "2. Choose the format to convert to using inline buttons.\n"
+                "1. Send a Telethon `.session` file.\n"
+                "2. Choose a format (JSON, TDATA, TXT, StringSession) using inline buttons.\n"
                 "3. Receive the converted file.\n\n"
-                "Supported formats: JSON, TDATA, TXT, StringSession.\n"
+                "**Using Converted Files in Telegram Desktop**:\n"
+                "- **TDATA**: Extract the zip to a folder and point Telegram Desktop to it.\n"
+                "- **StringSession**: Use in a Telethon script to log in.\n"
+                "- **JSON**: For developers to reconstruct sessions programmatically.\n"
+                "- **TXT**: Raw session file copy.\n\n"
                 f"Rate limit: {RATE_LIMIT} conversions per hour.\n"
-                "Contact admin for support.",
-                reply_markup=get_help_menu_buttons()
-            )
+                "Contact admin for support."
+            ):
+                await callback_query.message.edit_text(
+                    "📚 **Help**\n"
+                    "1. Send a Telethon `.session` file.\n"
+                    "2. Choose a format (JSON, TDATA, TXT, StringSession) using inline buttons.\n"
+                    "3. Receive the converted file.\n\n"
+                    "**Using Converted Files in Telegram Desktop**:\n"
+                    "- **TDATA**: Extract the zip to a folder and point Telegram Desktop to it.\n"
+                    "- **StringSession**: Use in a Telethon script to log in.\n"
+                    "- **JSON**: For developers to reconstruct sessions programmatically.\n"
+                    "- **TXT**: Raw session file copy.\n\n"
+                    f"Rate limit: {RATE_LIMIT} conversions per hour.\n"
+                    "Contact admin for support.",
+                    reply_markup=get_help_menu_buttons()
+                )
             await callback_query.answer()
             return
 
         if data == "back":
             logger.info(f"Back button pressed by user {user_id}")
-            await callback_query.message.edit_text(
+            if callback_query.message.text != (
                 "Welcome to the Session Converter Bot! 📂\n"
-                "Send a session file (.session, tdata folder, or string) to convert it to JSON, TDATA, TXT, or StringSession.\n"
-                "Use /help for more info.",
-                reply_markup=get_main_menu_buttons()
-            )
+                "Send a Telethon .session file to convert it to JSON, TDATA, TXT, or StringSession for use in Telegram Desktop.\n"
+                "Use /help for more info."
+            ):
+                await callback_query.message.edit_text(
+                    "Welcome to the Session Converter Bot! 📂\n"
+                    "Send a Telethon .session file to convert it to JSON, TDATA, TXT, or StringSession for use in Telegram Desktop.\n"
+                    "Use /help for more info.",
+                    reply_markup=get_main_menu_buttons()
+                )
             await callback_query.answer()
             return
 
@@ -474,7 +518,7 @@ async def handle_callback(client, callback_query):
                 return
             session_file = result[0]
 
-        # Check if message needs updating to avoid MESSAGE_NOT_MODIFIED
+        # Update message only if necessary
         if callback_query.message.text != "Converting... Please wait.":
             await callback_query.message.edit_text("Converting... Please wait.")
 
@@ -495,8 +539,8 @@ async def handle_callback(client, callback_query):
 
             # Send converted file
             await callback_query.message.reply_document(
-                document= output_path,
-                caption=f"Converted to {format_type.upper()}",
+                document=output_path,
+                caption=f"Converted to {format_type.upper()}. Use this file to log in to Telegram Desktop.",
                 reply_markup=get_format_buttons(user_id, short_session_id, session_file.split("_", 1)[-1])
             )
             # Clean up
@@ -517,30 +561,45 @@ async def handle_callback(client, callback_query):
                 f"Conversion failed: {output_path}",
                 reply_markup=get_format_buttons(user_id, short_session_id, session_file.split("_", 1)[-1])
             )
+    except MessageNotModified:
+        logger.info(f"Message not modified for user {user_id}, skipping edit")
+        await callback_query.answer()
     except Exception as e:
         logger.error(f"Error in callback for user {user_id}: {e}")
         error_message = f"Error during conversion: {str(e)}"
         try:
-            # Fallback to safe reply if edit fails
-            if callback_query.message.text != error_message:
-                await callback_query.message.edit_text(
-                    error_message,
-                    reply_markup=get_main_menu_buttons()
-                )
-        except Exception as edit_e:
-            logger.error(f"Failed to edit message for user {user_id}: {edit_e}")
             await callback_query.message.reply_text(
                 error_message,
                 reply_markup=get_main_menu_buttons()
             )
+        except Exception as reply_e:
+            logger.error(f"Failed to reply for user {user_id}: {reply_e}")
+
+# Signal handler for graceful shutdown
+def handle_shutdown(signum, frame):
+    logger.info("Shutdown signal received. Cleaning up...")
+    try:
+        files = os.listdir(SESSION_DIR)
+        for file in files:
+            file_path = os.path.join(SESSION_DIR, file)
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+    except Exception as e:
+        logger.error(f"Error during cleanup: {e}")
+    finally:
+        logger.info("Bot shutdown complete.")
+        raise SystemExit
+
+signal.signal(signal.SIGINT, handle_shutdown)
+signal.signal(signal.SIGTERM, handle_shutdown)
 
 # Main function to run the bot
 if __name__ == "__main__":
     logger.info("Starting bot...")
     try:
         app.run()
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user.")
+    except SystemExit:
+        pass
     except Exception as e:
         logger.error(f"Bot crashed: {e}")
     finally:
