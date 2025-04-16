@@ -253,7 +253,11 @@ async def handle_callback(client, callback_query):
 async def main():
     await app.start()
     print("Bot is running...")
-    await app.idle()
+    try:
+        await app.run()  # Use app.run() instead of app.idle()
+    except KeyboardInterrupt:
+        await app.stop()
+        print("Bot stopped.")
 
 if __name__ == "__main__":
     asyncio.run(main())
