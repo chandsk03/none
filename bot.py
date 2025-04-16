@@ -2,7 +2,7 @@ import asyncio
 import logging
 import random
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.types import Message, CallbackQuery
@@ -12,6 +12,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.exceptions import TelegramNetworkError, TelegramBadRequest
+from aiogram.client.default import DefaultBotProperties
 import re
 import hashlib
 
@@ -29,6 +30,8 @@ MAX_FRAUD_DETAIL_LENGTH = 1000
 RETRY_ATTEMPTS = 3
 RETRY_DELAY = 2  # seconds
 USERNAME_CHECK_INTERVAL = 3600  # seconds (1 hour)
+MESSAGE_DELETE_DELAY = 300  # seconds (5 minutes)
+REPORT_STATUS_UPDATE_INTERVAL = 600  # seconds (10 minutes)
 
 # --- Logging ---
 logging.basicConfig(
@@ -42,7 +45,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Bot Setup ---
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 dp = Dispatcher(storage=MemoryStorage())
 
 # --- SQLite Setup ---
@@ -55,11 +61,13 @@ def init_db():
             user_id INTEGER,
             username TEXT,
             fraud_username TEXT,
+            fraud_user_id INTEGER,
             fraud TEXT,
             contact TEXT,
             photo_id TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            status TEXT DEFAULT 'pending'
+            status TEXT DEFAULT 'pending',
+            admin_notes TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
     cursor.execute("""
@@ -79,6 +87,7 @@ def init_db():
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_fraud_user_id ON fraud_usernames(fraud_user_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_report_status ON reports(status)")
     conn.commit()
     return conn, cursor
 
@@ -92,6 +101,11 @@ class ReportStates(StatesGroup):
     proof = State()
     contact = State()
     confirm = State()
+
+class AdminReviewStates(StatesGroup):
+    select_report = State()
+    update_status = State()
+    add_notes = State()
 
 # --- Utility Functions ---
 def generate_captcha():
@@ -154,14 +168,22 @@ async def retry_api_call(coro, max_attempts=RETRY_ATTEMPTS, delay=RETRY_DELAY):
             await asyncio.sleep(delay * (2 ** attempt))
     raise Exception("Max retry attempts reached")
 
-async def safe_message_action(message, action, text, reply_markup=None):
+async def safe_message_action(message, action, text, reply_markup=None, **kwargs):
     try:
-        if action == "edit" and message.text is None:
-            return await retry_api_call(message.answer(text, reply_markup=reply_markup))
-        return await retry_api_call(getattr(message, action)(text, reply_markup=reply_markup))
+        if action == "edit_text" and message.text is None:
+            return await retry_api_call(message.answer(text, reply_markup=reply_markup, **kwargs))
+        return await retry_api_call(getattr(message, action)(text, reply_markup=reply_markup, **kwargs))
     except TelegramBadRequest as e:
         logger.warning(f"Failed to {action} message: {e}")
-        return await retry_api_call(message.answer(text, reply_markup=reply_markup))
+        return await retry_api_call(message.answer(text, reply_markup=reply_markup, **kwargs))
+
+async def delete_message_later(message, delay=MESSAGE_DELETE_DELAY):
+    try:
+        await asyncio.sleep(delay)
+        await retry_api_call(message.delete())
+        logger.info(f"Deleted message {message.message_id} from chat {message.chat.id}")
+    except Exception as e:
+        logger.warning(f"Failed to delete message {message.message_id}: {e}")
 
 async def check_fraud_username_changes():
     while True:
@@ -182,10 +204,11 @@ async def check_fraud_username_changes():
                         )
                         conn.commit()
                         try:
-                            await bot.send_message(
+                            msg = await bot.send_message(
                                 user_id,
-                                "🚨 We noticed you changed your username. Please be aware that fraudulent activities are being monitored."
+                                "🚨 We've noticed you changed your username. Fraudulent activities are under investigation."
                             )
+                            await delete_message_later(msg, delay=600)  # Delete fraudster message after 10 minutes
                             logger.info(f"Sent username change warning to user {user_id} ({current_username})")
                         except TelegramBadRequest as e:
                             logger.warning(f"Failed to message user {user_id}: {e}")
@@ -195,10 +218,38 @@ async def check_fraud_username_changes():
             logger.error(f"Error in username change check: {e}")
         await asyncio.sleep(USERNAME_CHECK_INTERVAL)
 
+async def send_status_updates():
+    while True:
+        try:
+            cursor.execute("SELECT user_id, report_id, status, admin_notes FROM reports WHERE status != 'pending'")
+            reports = cursor.fetchall()
+            for user_id, report_id, status, admin_notes in reports:
+                cursor.execute("SELECT notified FROM reports WHERE report_id = ?", (report_id,))
+                notified = cursor.fetchone()[0] if cursor.fetchone() else False
+                if not notified:
+                    try:
+                        msg = await bot.send_message(
+                            user_id,
+                            f"📢 <b>Report Update</b> | ID: {report_id}\n"
+                            f"Status: <b>{status}</b>\n"
+                            f"Admin Notes: {admin_notes or 'None'}\n\n"
+                            "Thank you for your report!"
+                        )
+                        cursor.execute("UPDATE reports SET notified = 1 WHERE report_id = ?", (report_id,))
+                        conn.commit()
+                        await delete_message_later(msg)
+                        logger.info(f"Sent status update for report {report_id} to user {user_id}")
+                    except TelegramBadRequest as e:
+                        logger.warning(f"Failed to send status update to user {user_id}: {e}")
+        except Exception as e:
+            logger.error(f"Error in status update task: {e}")
+        await asyncio.sleep(REPORT_STATUS_UPDATE_INTERVAL)
+
 # --- Inline Buttons ---
 def start_buttons():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📢 Report a Fraud", callback_data="start_report")],
+        [InlineKeyboardButton(text="📜 My Reports", callback_data="view_reports")],
         [InlineKeyboardButton(text="ℹ️ Help", callback_data="show_help")]
     ])
 
@@ -213,54 +264,281 @@ def help_buttons():
         [InlineKeyboardButton(text="🔙 Back", callback_data="back_to_start")]
     ])
 
+def admin_buttons():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Review Reports", callback_data="review_reports")],
+        [InlineKeyboardButton(text="📊 Statistics", callback_data="view_stats")]
+    ])
+
+def report_status_buttons(report_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Mark Resolved", callback_data=f"update_status_{report_id}_resolved")],
+        [InlineKeyboardButton(text="🔍 Mark Under Review", callback_data=f"update_status_{report_id}_under_review")],
+        [InlineKeyboardButton(text="📝 Add Notes", callback_data=f"add_notes_{report_id}")]
+    ])
+
+def report_list_buttons(reports):
+    keyboard = []
+    for report_id, status in reports:
+        keyboard.append([InlineKeyboardButton(
+            text=f"Report {report_id[:8]}... ({status})",
+            callback_data=f"select_report_{report_id}"
+        )])
+    keyboard.append([InlineKeyboardButton(text="🔙 Back", callback_data="admin_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
 # --- Handlers ---
 @dp.message(CommandStart())
 async def handle_start(msg: Message, state: FSMContext):
     welcome_text = (
-        f"👋 Welcome, <b>{msg.from_user.full_name}</b>!\n\n"
-        "This bot helps you report fraudulent activities securely.\n"
-        "Use the buttons below to start a report or get help."
+        f"👋 Hey <b>{msg.from_user.full_name}</b>! I'm here to help you report fraud safely and securely.\n\n"
+        "🔍 Want to report a scam? Hit 'Report a Fraud'.\n"
+        "📜 Curious about your past reports? Check 'My Reports'.\n"
+        "ℹ️ Need guidance? Tap 'Help'.\n\n"
+        "Let's keep the community safe together! 😊"
     )
     try:
-        await retry_api_call(msg.answer(welcome_text, reply_markup=start_buttons()))
+        sent_msg = await retry_api_call(msg.answer(welcome_text, reply_markup=start_buttons()))
+        await delete_message_later(msg)
+        await delete_message_later(sent_msg)
         logger.info(f"User {msg.from_user.id} started the bot")
     except Exception as e:
         logger.error(f"Failed to send welcome message to user {msg.from_user.id}: {e}")
-        await msg.answer("⚠️ Unable to start the bot. Please try again later.")
+        await msg.answer("⚠️ Oops, something went wrong. Please try again later.")
 
-@dp.message(Command('stats'), lambda msg: msg.from_user.id in ADMIN_IDS)
-async def handle_stats(msg: Message):
+@dp.message(Command('admin'), lambda msg: msg.from_user.id in ADMIN_IDS)
+async def handle_admin(msg: Message):
+    admin_text = (
+        "🛠️ <b>Admin Panel</b>\n\n"
+        "Welcome, admin! Choose an action:\n"
+        "- 📋 Review pending reports\n"
+        "- 📊 View bot statistics"
+    )
+    try:
+        sent_msg = await retry_api_call(msg.answer(admin_text, reply_markup=admin_buttons()))
+        await delete_message_later(msg)
+        await delete_message_later(sent_msg)
+        logger.info(f"Admin {msg.from_user.id} accessed admin panel")
+    except Exception as e:
+        logger.error(f"Failed to send admin panel to user {msg.from_user.id}: {e}")
+        await msg.answer("⚠️ Unable to access admin panel. Please try again later.")
+
+@dp.callback_query(F.data == "admin_menu")
+async def admin_menu(cb: CallbackQuery):
+    admin_text = (
+        "🛠️ <b>Admin Panel</b>\n\n"
+        "Choose an action:\n"
+        "- 📋 Review pending reports\n"
+        "- 📊 View bot statistics"
+    )
+    try:
+        await safe_message_action(cb.message, "edit_text", admin_text, reply_markup=admin_buttons())
+        logger.info(f"Admin {cb.from_user.id} returned to admin menu")
+    except Exception as e:
+        logger.error(f"Failed to show admin menu for user {cb.from_user.id}: {e}")
+        await cb.message.answer("⚠️ Unable to show admin panel. Please try again.")
+
+@dp.callback_query(F.data == "view_stats")
+async def handle_stats(cb: CallbackQuery):
     try:
         cursor.execute("SELECT COUNT(*) FROM reports")
         total_reports = cursor.fetchone()[0]
         cursor.execute("SELECT COUNT(*) FROM reports WHERE status = 'pending'")
         pending_reports = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM reports WHERE status = 'resolved'")
+        resolved_reports = cursor.fetchone()[0]
         stats_text = (
-            f"📊 Bot Statistics:\n"
+            f"📊 <b>Bot Statistics</b>\n\n"
             f"Total Reports: {total_reports}\n"
-            f"Pending Reports: {pending_reports}"
+            f"Pending Reports: {pending_reports}\n"
+            f"Resolved Reports: {resolved_reports}\n\n"
+            "Keep up the great work! 😎"
         )
-        await retry_api_call(msg.answer(stats_text))
-        logger.info(f"Admin {msg.from_user.id} requested stats")
+        sent_msg = await safe_message_action(cb.message, "edit_text", stats_text, reply_markup=admin_buttons())
+        await delete_message_later(sent_msg)
+        logger.info(f"Admin {cb.from_user.id} requested stats")
     except Exception as e:
-        logger.error(f"Failed to fetch stats for admin {msg.from_user.id}: {e}")
-        await msg.answer("⚠️ Unable to fetch statistics. Please try again later.")
+        logger.error(f"Failed to fetch stats for admin {cb.from_user.id}: {e}")
+        await cb.message.answer("⚠️ Unable to fetch statistics. Please try again later.")
+
+@dp.callback_query(F.data == "review_reports")
+async def review_reports(cb: CallbackQuery, state: FSMContext):
+    try:
+        cursor.execute("SELECT report_id, status FROM reports WHERE status IN ('pending', 'under_review') LIMIT 10")
+        reports = cursor.fetchall()
+        if not reports:
+            await safe_message_action(
+                cb.message, "edit_text",
+                "🎉 No pending reports to review! You're all caught up.",
+                reply_markup=admin_buttons()
+            )
+            return
+        report_list_text = (
+            "📋 <b>Pending Reports</b>\n\n"
+            "Select a report to review:"
+        )
+        await safe_message_action(
+            cb.message, "edit_text",
+            report_list_text, reply_markup=report_list_buttons(reports)
+        )
+        await state.set_state(AdminReviewStates.select_report)
+        logger.info(f"Admin {cb.from_user.id} started reviewing reports")
+    except Exception as e:
+        logger.error(f"Failed to list reports for admin {cb.from_user.id}: {e}")
+        await cb.message.answer("⚠️ Unable to list reports. Please try again.")
+
+@dp.callback_query(F.data.startswith("select_report_"), StateFilter(AdminReviewStates.select_report))
+async def select_report(cb: CallbackQuery, state: FSMContext):
+    report_id = cb.data.split("_")[2]
+    try:
+        cursor.execute(
+            "SELECT user_id, username, fraud_username, fraud, contact, photo_id, status, admin_notes "
+            "FROM reports WHERE report_id = ?",
+            (report_id,)
+        )
+        report = cursor.fetchone()
+        if not report:
+            await safe_message_action(
+                cb.message, "edit_text",
+                "⚠️ Report not found.", reply_markup=admin_buttons()
+            )
+            return
+        user_id, username, fraud_username, fraud, contact, photo_id, status, admin_notes = report
+        report_text = (
+            f"<b>Report Details</b> | ID: {report_id}\n\n"
+            f"<b>User:</b> @{username or 'NoUsername'} | ID: {user_id}\n"
+            f"<b>Fraudster:</b> {fraud_username or 'Unknown'}\n"
+            f"<b>Details:</b> {fraud}\n"
+            f"<b>Contact:</b> {contact}\n"
+            f"<b>Status:</b> {status}\n"
+            f"<b>Admin Notes:</b> {admin_notes or 'None'}\n\n"
+            "Choose an action:"
+        )
+        sent_msg = await retry_api_call(cb.message.answer_photo(
+            photo=photo_id,
+            caption=report_text,
+            reply_markup=report_status_buttons(report_id)
+        ))
+        await delete_message_later(sent_msg, delay=600)  # Delete after 10 minutes
+        await state.update_data(report_id=report_id)
+        logger.info(f"Admin {cb.from_user.id} selected report {report_id}")
+    except Exception as e:
+        logger.error(f"Failed to show report {report_id} for admin {cb.from_user.id}: {e}")
+        await cb.message.answer("⚠️ Unable to show report details. Please try again.")
+
+@dp.callback_query(F.data.startswith("update_status_"), StateFilter(AdminReviewStates.select_report))
+async def update_status(cb: CallbackQuery, state: FSMContext):
+    try:
+        report_id = cb.data.split("_")[2]
+        new_status = cb.data.split("_")[3]
+        cursor.execute("UPDATE reports SET status = ? WHERE report_id = ?", (new_status, report_id))
+        conn.commit()
+        await safe_message_action(
+            cb.message, "edit_text",
+            f"✅ Report {report_id[:8]}... status updated to <b>{new_status}</b>.",
+            reply_markup=report_status_buttons(report_id)
+        )
+        logger.info(f"Admin {cb.from_user.id} updated report {report_id} status to {new_status}")
+    except Exception as e:
+        logger.error(f"Failed to update status for report {report_id} by admin {cb.from_user.id}: {e}")
+        await cb.message.answer("⚠️ Unable to update status. Please try again.")
+
+@dp.callback_query(F.data.startswith("add_notes_"), StateFilter(AdminReviewStates.select_report))
+async def add_notes_prompt(cb: CallbackQuery, state: FSMContext):
+    report_id = cb.data.split("_")[2]
+    try:
+        await safe_message_action(
+            cb.message, "edit_text",
+            f"📝 Please enter notes for report {report_id[:8]}... (max 500 characters):"
+        )
+        await state.update_data(report_id=report_id)
+        await state.set_state(AdminReviewStates.add_notes)
+        logger.info(f"Admin {cb.from_user.id} prompted to add notes for report {report_id}")
+    except Exception as e:
+        logger.error(f"Failed to prompt notes for report {report_id} by admin {cb.from_user.id}: {e}")
+        await cb.message.answer("⚠️ Unable to add notes. Please try again.")
+
+@dp.message(StateFilter(AdminReviewStates.add_notes))
+async def handle_notes(msg: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        report_id = data.get("report_id")
+        if len(msg.text) > 500:
+            sent_msg = await retry_api_call(msg.answer("⚠️ Notes too long. Please keep under 500 characters."))
+            await delete_message_later(msg)
+            await delete_message_later(sent_msg)
+            return
+        cursor.execute("UPDATE reports SET admin_notes = ? WHERE report_id = ?", (msg.text, report_id))
+        conn.commit()
+        sent_msg = await retry_api_call(msg.answer(
+            f"✅ Notes added to report {report_id[:8]}...!",
+            reply_markup=report_status_buttons(report_id)
+        ))
+        await delete_message_later(msg)
+        await delete_message_later(sent_msg)
+        logger.info(f"Admin {msg.from_user.id} added notes to report {report_id}")
+    except Exception as e:
+        logger.error(f"Failed to add notes for report {report_id} by admin {msg.from_user.id}: {e}")
+        sent_msg = await msg.answer("⚠️ Unable to add notes. Please try again.")
+        await delete_message_later(sent_msg)
+    finally:
+        await state.set_state(AdminReviewStates.select_report)
+
+@dp.callback_query(F.data == "view_reports")
+async def view_user_reports(cb: CallbackQuery):
+    try:
+        cursor.execute(
+            "SELECT report_id, fraud_username, status, timestamp FROM reports WHERE user_id = ? ORDER BY timestamp DESC LIMIT 5",
+            (cb.from_user.id,)
+        )
+        reports = cursor.fetchall()
+        if not reports:
+            await safe_message_action(
+                cb.message, "edit_text",
+                "📭 You haven't submitted any reports yet. Start one with 'Report a Fraud'!",
+                reply_markup=start_buttons()
+            )
+            return
+        report_text = "<b>Your Recent Reports</b>\n\n"
+        for report_id, fraud_username, status, timestamp in reports:
+            report_text += (
+                f"📋 <b>ID:</b> {report_id[:8]}...\n"
+                f"👤 <b>Fraudster:</b> {fraud_username or 'Unknown'}\n"
+                f"📊 <b>Status:</b> {status}\n"
+                f"🕒 <b>Date:</b> {timestamp}\n\n"
+            )
+        sent_msg = await safe_message_action(
+            cb.message, "edit_text",
+            report_text, reply_markup=start_buttons()
+        )
+        await delete_message_later(sent_msg)
+        logger.info(f"User {cb.from_user.id} viewed their reports")
+    except Exception as e:
+        logger.error(f"Failed to show reports for user {cb.from_user.id}: {e}")
+        await cb.message.answer("⚠️ Unable to show your reports. Please try again.")
 
 @dp.callback_query(F.data == "show_help")
 async def handle_help(cb: CallbackQuery):
     help_text = (
-        "ℹ️ <b>How to use this bot:</b>\n\n"
-        "1. Click 'Report a Fraud' to start.\n"
-        "2. Pass a CAPTCHA to verify you're not a bot.\n"
-        "3. Enter the fraudster's Telegram username.\n"
-        "4. Describe the fraud in detail (max 1000 characters).\n"
-        "5. Upload proof (JPG/PNG image, max 10MB).\n"
-        "6. Provide contact info (Telegram username or phone).\n"
-        "7. Confirm and submit your report.\n\n"
-        "🔐 Your data is securely stored and only shared with moderators."
+        "ℹ️ <b>How to Report Fraud</b>\n\n"
+        "Hi there! I'm your friendly fraud-reporting bot. Here's how to use me:\n\n"
+        "1. Tap 'Report a Fraud' to begin.\n"
+        "2. Solve a quick CAPTCHA to prove you're human.\n"
+        "3. Share the fraudster's Telegram username (e.g., @BadUser).\n"
+        "4. Describe what happened (keep it under 1000 characters).\n"
+        "5. Upload a JPG/PNG screenshot as proof (max 10MB).\n"
+        "6. Provide your contact info (Telegram username or phone).\n"
+        "7. Review and submit your report.\n\n"
+        "🔐 Your info is safe with us, shared only with trusted moderators.\n"
+        "📜 Check 'My Reports' to see your report status.\n\n"
+        "Got questions? Just ask! 😊"
     )
     try:
-        await safe_message_action(cb.message, "edit_text", help_text, reply_markup=help_buttons())
+        sent_msg = await safe_message_action(
+            cb.message, "edit_text",
+            help_text, reply_markup=help_buttons()
+        )
+        await delete_message_later(sent_msg)
         logger.info(f"User {cb.from_user.id} viewed help")
     except Exception as e:
         logger.error(f"Failed to send help message to user {cb.from_user.id}: {e}")
@@ -279,62 +557,75 @@ async def back_to_start(cb: CallbackQuery, state: FSMContext):
 async def handle_report_start(cb: CallbackQuery, state: FSMContext):
     try:
         if not await check_user_limit(cb.from_user.id):
-            await safe_message_action(
+            sent_msg = await safe_message_action(
                 cb.message, "edit_text",
-                f"⚠️ You've reached the daily limit of {MAX_REPORTS_PER_DAY} reports. Try again tomorrow.",
+                f"⚠️ You've hit the daily limit of {MAX_REPORTS_PER_DAY} reports. Try again tomorrow!",
                 reply_markup=start_buttons()
             )
+            await delete_message_later(sent_msg)
             logger.info(f"User {cb.from_user.id} exceeded daily report limit")
             return
 
         cursor.execute("SELECT * FROM reports WHERE user_id = ? AND status = 'pending'", (cb.from_user.id,))
         if cursor.fetchone():
-            await safe_message_action(
+            sent_msg = await safe_message_action(
                 cb.message, "edit_text",
-                "⚠️ You have a pending report. Please wait for it to be reviewed before submitting another.",
+                "⚠️ You have a pending report. Please wait for review before submitting another.",
                 reply_markup=start_buttons()
             )
+            await delete_message_later(sent_msg)
             logger.info(f"User {cb.from_user.id} has pending report")
             return
 
         num1, num2, op, answer = generate_captcha()
         await state.update_data(captcha_answer=answer)
-        await safe_message_action(
+        sent_msg = await safe_message_action(
             cb.message, "edit_text",
-            f"Please solve this CAPTCHA to continue:\n<b>{num1} {op} {num2} = ?</b>"
+            f"Let's get started! Solve this CAPTCHA:\n<b>{num1} {op} {num2} = ?</b>"
         )
+        await delete_message_later(sent_msg)
         await state.set_state(ReportStates.captcha)
         logger.info(f"User {cb.from_user.id} started report process")
     except Exception as e:
         logger.error(f"Failed to start report for user {cb.from_user.id}: {e}")
-        await cb.message.answer("⚠️ Unable to start report. Please try again.")
+        sent_msg = await cb.message.answer("⚠️ Unable to start report. Please try again.")
+        await delete_message_later(sent_msg)
 
 @dp.message(StateFilter(ReportStates.captcha))
 async def handle_captcha_answer(msg: Message, state: FSMContext):
     try:
         data = await state.get_data()
         if not data.get("captcha_answer"):
-            await retry_api_call(msg.answer("⚠️ Session expired. Please start again with /start."))
+            sent_msg = await retry_api_call(msg.answer("⚠️ Session expired. Please start again with /start."))
+            await delete_message_later(msg)
+            await delete_message_later(sent_msg)
             await state.clear()
             return
         if msg.text.strip() == data.get("captcha_answer"):
-            await retry_api_call(msg.answer("✅ CAPTCHA passed. Please enter the fraudster's Telegram username (e.g., @username)."))
+            sent_msg = await retry_api_call(msg.answer("✅ Nice job! Now, what's the fraudster's Telegram username? (e.g., @BadUser)"))
+            await delete_message_later(msg)
+            await delete_message_later(sent_msg)
             await state.set_state(ReportStates.fraud_username)
             logger.info(f"User {msg.from_user.id} passed CAPTCHA")
         else:
             num1, num2, op, answer = generate_captcha()
             await state.update_data(captcha_answer=answer)
-            await retry_api_call(msg.answer(f"❌ Incorrect CAPTCHA. Try again:\n<b>{num1} {op} {num2} = ?</b>"))
+            sent_msg = await retry_api_call(msg.answer(f"❌ Oops, that's not right. Try again:\n<b>{num1} {op} {num2} = ?</b>"))
+            await delete_message_later(msg)
+            await delete_message_later(sent_msg)
             logger.warning(f"User {msg.from_user.id} failed CAPTCHA")
     except Exception as e:
         logger.error(f"Failed to process CAPTCHA for user {msg.from_user.id}: {e}")
-        await msg.answer("⚠️ Error processing CAPTCHA. Please try again.")
+        sent_msg = await msg.answer("⚠️ Error processing CAPTCHA. Please try again.")
+        await delete_message_later(sent_msg)
 
 @dp.message(StateFilter(ReportStates.fraud_username))
 async def handle_fraud_username(msg: Message, state: FSMContext):
     try:
         if not validate_username(msg.text):
-            await retry_api_call(msg.answer("⚠️ Invalid username. Please provide a valid Telegram username starting with @ (e.g., @username)."))
+            sent_msg = await retry_api_call(msg.answer("⚠️ Invalid username. Please use a valid Telegram username starting with @ (e.g., @BadUser)."))
+            await delete_message_later(msg)
+            await delete_message_later(sent_msg)
             logger.warning(f"User {msg.from_user.id} submitted invalid fraud username")
             return
         fraud_username = msg.text.strip()
@@ -345,62 +636,81 @@ async def handle_fraud_username(msg: Message, state: FSMContext):
         except TelegramBadRequest as e:
             logger.warning(f"Could not fetch user ID for {fraud_username}: {e}")
         await state.update_data(fraud_username=fraud_username, fraud_user_id=fraud_user_id)
-        await retry_api_call(msg.answer("Please describe the fraud you experienced (max 1000 characters)."))
+        sent_msg = await retry_api_call(msg.answer("Got it. Please describe the fraud (max 1000 characters). Be as detailed as possible!"))
+        await delete_message_later(msg)
+        await delete_message_later(sent_msg)
         await state.set_state(ReportStates.fraud_detail)
         logger.info(f"User {msg.from_user.id} submitted fraud username {fraud_username}")
     except Exception as e:
         logger.error(f"Failed to process fraud username for user {msg.from_user.id}: {e}")
-        await msg.answer("⚠️ Error processing fraud username. Please try again.")
+        sent_msg = await msg.answer("⚠️ Error processing fraud username. Please try again.")
+        await delete_message_later(sent_msg)
 
 @dp.message(StateFilter(ReportStates.fraud_detail))
 async def handle_fraud_detail(msg: Message, state: FSMContext):
     try:
         if len(msg.text) > MAX_FRAUD_DETAIL_LENGTH:
-            await retry_api_call(msg.answer(f"⚠️ Description too long. Please keep it under {MAX_FRAUD_DETAIL_LENGTH} characters."))
+            sent_msg = await retry_api_call(msg.answer(f"⚠️ Description too long. Please keep it under {MAX_FRAUD_DETAIL_LENGTH} characters."))
+            await delete_message_later(msg)
+            await delete_message_later(sent_msg)
             logger.warning(f"User {msg.from_user.id} submitted too long fraud detail")
             return
         await state.update_data(fraud_detail=msg.text)
-        await retry_api_call(msg.answer("Please upload proof of the fraud (JPG/PNG image, max 10MB)."))
+        sent_msg = await retry_api_call(msg.answer("Thanks for the details. Now, upload a JPG/PNG image as proof (max 10MB)."))
+        await delete_message_later(msg)
+        await delete_message_later(sent_msg)
         await state.set_state(ReportStates.proof)
         logger.info(f"User {msg.from_user.id} submitted fraud details")
     except Exception as e:
         logger.error(f"Failed to process fraud details for user {msg.from_user.id}: {e}")
-        await msg.answer("⚠️ Error processing fraud details. Please try again.")
+        sent_msg = await msg.answer("⚠️ Error processing fraud details. Please try again.")
+        await delete_message_later(sent_msg)
 
 @dp.message(StateFilter(ReportStates.proof))
 async def handle_proof(msg: Message, state: FSMContext):
     try:
         if not msg.photo:
-            await retry_api_call(msg.answer("⚠️ Please send an image as proof (JPG/PNG)."))
+            sent_msg = await retry_api_call(msg.answer("⚠️ Please send a JPG/PNG image as proof."))
+            await delete_message_later(msg)
+            await delete_message_later(sent_msg)
             logger.warning(f"User {msg.from_user.id} sent non-image proof")
             return
         
         photo = msg.photo[-1]
         file_info = await bot.get_file(photo.file_id)
         if file_info.file_size > MAX_IMAGE_SIZE:
-            await retry_api_call(msg.answer("⚠️ Image too large. Please upload an image under 10MB."))
+            sent_msg = await retry_api_call(msg.answer("⚠️ Image too large. Please upload an image under 10MB."))
+            await delete_message_later(msg)
+            await delete_message_later(sent_msg)
             logger.warning(f"User {msg.from_user.id} sent oversized image")
             return
         
         file_ext = file_info.file_path.lower().split('.')[-1]
         if f'.{file_ext}' not in ALLOWED_IMAGE_EXTENSIONS:
-            await retry_api_call(msg.answer("⚠️ Only JPG and PNG images are allowed."))
+            sent_msg = await retry_api_call(msg.answer("⚠️ Only JPG and PNG images are allowed."))
+            await delete_message_later(msg)
+            await delete_message_later(sent_msg)
             logger.warning(f"User {msg.from_user.id} sent invalid image format")
             return
 
         await state.update_data(proof_id=photo.file_id)
-        await retry_api_call(msg.answer("Please provide your contact info (Telegram username starting with @ or phone number)."))
+        sent_msg = await retry_api_call(msg.answer("Great! Finally, share your contact info (Telegram username or phone number)."))
+        await delete_message_later(msg)
+        await delete_message_later(sent_msg)
         await state.set_state(ReportStates.contact)
         logger.info(f"User {msg.from_user.id} uploaded proof")
     except Exception as e:
         logger.error(f"Failed to process proof for user {msg.from_user.id}: {e}")
-        await msg.answer("⚠️ Error processing proof. Please try again.")
+        sent_msg = await msg.answer("⚠️ Error processing proof. Please try again.")
+        await delete_message_later(sent_msg)
 
 @dp.message(StateFilter(ReportStates.contact))
 async def handle_contact(msg: Message, state: FSMContext):
     try:
         if not validate_contact(msg.text):
-            await retry_api_call(msg.answer("⚠️ Invalid contact. Please provide a valid Telegram username (@username) or phone number."))
+            sent_msg = await retry_api_call(msg.answer("⚠️ Invalid contact. Please provide a valid Telegram username (@username) or phone number."))
+            await delete_message_later(msg)
+            await delete_message_later(sent_msg)
             logger.warning(f"User {msg.from_user.id} submitted invalid contact")
             return
         
@@ -411,23 +721,26 @@ async def handle_contact(msg: Message, state: FSMContext):
         
         fraud_username = data.get("fraud_username", "Unknown")
         preview = (
-            f"<b>Fraud Report Preview:</b>\n\n"
-            f"<b>User:</b> @{msg.from_user.username or 'NoUsername'}\n"
+            f"<b>Fraud Report Preview</b>\n\n"
+            f"<b>Your Username:</b> @{msg.from_user.username or 'NoUsername'}\n"
             f"<b>Fraudster:</b> {fraud_username}\n"
             f"<b>Details:</b> {data.get('fraud_detail', '')[:100]}...\n"
             f"<b>Contact:</b> {data.get('contact', '')}\n\n"
-            f"Click below to confirm and send the report."
+            f"Does this look good? Confirm to submit or cancel to start over."
         )
-        await retry_api_call(msg.answer_photo(
+        sent_msg = await retry_api_call(msg.answer_photo(
             photo=data['proof_id'],
             caption=preview,
             reply_markup=confirm_buttons(report_id)
         ))
+        await delete_message_later(msg)
+        await delete_message_later(sent_msg, delay=600)  # Keep preview longer
         await state.set_state(ReportStates.confirm)
         logger.info(f"User {msg.from_user.id} submitted contact")
     except Exception as e:
         logger.error(f"Failed to process contact for user {msg.from_user.id}: {e}")
-        await msg.answer("⚠️ Error processing contact. Please try again.")
+        sent_msg = await msg.answer("⚠️ Error processing contact. Please try again.")
+        await delete_message_later(sent_msg)
 
 @dp.callback_query(F.data.startswith("confirm_report_"))
 async def finish_report(cb: CallbackQuery, state: FSMContext):
@@ -435,19 +748,21 @@ async def finish_report(cb: CallbackQuery, state: FSMContext):
         data = await state.get_data()
         report_id = data.get("report_id")
         if not report_id or not data.get("proof_id"):
-            await retry_api_call(cb.message.answer("⚠️ Report data incomplete. Please start again with /start."))
+            sent_msg = await retry_api_call(cb.message.answer("⚠️ Report data incomplete. Please start again with /start."))
+            await delete_message_later(sent_msg)
             await state.clear()
             return
         
         fraud_username = data.get("fraud_username", "Unknown")
         cursor.execute(
-            "INSERT INTO reports (report_id, user_id, username, fraud_username, fraud, contact, photo_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO reports (report_id, user_id, username, fraud_username, fraud_user_id, fraud, contact, photo_id, notified) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
             (
                 report_id,
                 cb.from_user.id,
                 cb.from_user.username,
                 fraud_username,
+                data.get("fraud_user_id"),
                 data.get("fraud_detail", ""),
                 data.get("contact", ""),
                 data["proof_id"]
@@ -469,24 +784,41 @@ async def finish_report(cb: CallbackQuery, state: FSMContext):
         )
         
         for chat_id in [GROUP_ID, CHANNEL_ID]:
-            await retry_api_call(bot.send_photo(
+            sent_msg = await retry_api_call(bot.send_photo(
                 chat_id=chat_id,
                 photo=data["proof_id"],
                 caption=report_text
             ))
-        await safe_message_action(
+            await delete_message_later(sent_msg, delay=86400)  # Keep in group/channel for 24 hours
+        sent_msg = await safe_message_action(
             cb.message, "answer",
-            "✅ Your report has been submitted. Thank you for helping us fight fraud!",
+            "✅ Your report has been submitted! We'll keep you updated on its status. Thank you for helping us fight fraud! 😊",
             reply_markup=start_buttons()
         )
+        await delete_message_later(sent_msg)
         logger.info(f"Report {report_id} submitted by user {cb.from_user.id}")
+
+        # Notify admins in real-time
+        for admin_id in ADMIN_IDS:
+            try:
+                admin_msg = await bot.send_message(
+                    admin_id,
+                    f"🚨 <b>New Report Submitted</b> | ID: {report_id}\n"
+                    f"User: @{cb.from_user.username or 'NoUsername'}\n"
+                    f"Fraudster: {fraud_username}\n"
+                    f"Run /admin to review."
+                )
+                await delete_message_later(admin_msg)
+            except TelegramBadRequest as e:
+                logger.warning(f"Failed to notify admin {admin_id}: {e}")
     except Exception as e:
         logger.error(f"Failed to submit report for user {cb.from_user.id}: {e}")
-        await safe_message_action(
+        sent_msg = await safe_message_action(
             cb.message, "answer",
-            "⚠️ An error occurred while submitting your report. Please try again later.",
+            "⚠️ Something went wrong while submitting your report. Please try again later.",
             reply_markup=start_buttons()
         )
+        await delete_message_later(sent_msg)
     finally:
         await state.clear()
 
@@ -494,15 +826,17 @@ async def finish_report(cb: CallbackQuery, state: FSMContext):
 async def cancel_report(cb: CallbackQuery, state: FSMContext):
     try:
         await state.clear()
-        await safe_message_action(
+        sent_msg = await safe_message_action(
             cb.message, "answer",
-            "❌ Your report has been cancelled.",
+            "❌ Report cancelled. You can start a new one anytime! 😊",
             reply_markup=start_buttons()
         )
+        await delete_message_later(sent_msg)
         logger.info(f"User {cb.from_user.id} cancelled report")
     except Exception as e:
         logger.error(f"Failed to cancel report for user {cb.from_user.id}: {e}")
-        await cb.message.answer("⚠️ Error cancelling report. Please use /start.")
+        sent_msg = await cb.message.answer("⚠️ Error cancelling report. Please use /start.")
+        await delete_message_later(sent_msg)
 
 # --- Error Handler ---
 @dp.errors()
@@ -510,12 +844,14 @@ async def error_handler(update, exception):
     logger.error(f"Update {update} caused error: {exception}")
     if hasattr(update, 'message') and isinstance(update.message, Message):
         try:
-            await retry_api_call(update.message.answer("⚠️ An error occurred. Please try again later."))
+            sent_msg = await retry_api_call(update.message.answer("⚠️ Oops, something broke! Please try again later."))
+            await delete_message_later(sent_msg)
         except Exception as e:
             logger.error(f"Failed to send error message: {e}")
     elif hasattr(update, 'callback_query') and isinstance(update.callback_query, CallbackQuery):
         try:
-            await retry_api_call(update.callback_query.message.answer("⚠️ An error occurred. Please try again later."))
+            sent_msg = await retry_api_call(update.callback_query.message.answer("⚠️ Oops, something broke! Please try again later."))
+            await delete_message_later(sent_msg)
         except Exception as e:
             logger.error(f"Failed to send error message: {e}")
     return True
@@ -526,6 +862,7 @@ async def main():
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Bot started successfully")
         asyncio.create_task(check_fraud_username_changes())
+        asyncio.create_task(send_status_updates())
         await dp.start_polling(bot)
     except Exception as e:
         logger.critical(f"Bot crashed: {e}")
