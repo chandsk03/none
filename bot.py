@@ -1,5 +1,6 @@
 import os
 import logging
+import signal
 import schedule
 import asyncio
 import aiosqlite
@@ -33,7 +34,7 @@ ADMIN_ID = 6257711894
 bot = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # Directory for session files
-SESSION_DIR = "sessions"
+SESSION_DIR = "sessions> sessions"
 if not os.path.exists(SESSION_DIR):
     os.makedirs(SESSION_DIR)
 
@@ -490,28 +491,72 @@ async def handle_callback(client, callback_query):
 # Global start time for uptime tracking
 bot_start_time = datetime.now()
 
+# Shutdown handler
+async def shutdown(clients: List[Client]):
+    logger.info("Shutting down bot...")
+    for client in clients:
+        try:
+            await client.stop()
+            logger.info(f"Stopped client {client.name}")
+        except Exception as e:
+            logger.error(f"Error stopping client {client.name}: {e}")
+    await bot.stop()
+    logger.info("Bot stopped")
+
+# Signal handler for graceful shutdown
+def handle_shutdown(loop, clients):
+    logger.info("Received shutdown signal")
+    asyncio.run_coroutine_threadsafe(shutdown(clients), loop)
+    tasks = [task for task in asyncio.all_tasks(loop) if task is not asyncio.current_task()]
+    for task in tasks:
+        task.cancel()
+    loop.run_until_complete(loop.shutdown_asyncgens())
+    loop.close()
+    logger.info("Event loop closed")
+    exit(0)
+
 # Main function to run bot and scheduler
 async def main():
-    await init_db()
-    # Load recurring schedules from database
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT chat_id, text, media_path, interval_seconds FROM schedules WHERE is_recurring = 1")
-        recurring = await cursor.fetchall()
-        for chat_id, text, media_path, seconds in recurring:
-            async def recurring_task():
-                clients = await load_session_clients()
-                await send_message_with_session(clients, chat_id, text, media_path)
-            schedule.every(seconds).seconds.do(lambda: asyncio.create_task(recurring_task()))
-    await bot.start()
-    logger.info("Bot started")
-    while True:
-        try:
-            await check_scheduled_messages()
-            schedule.run_pending()
-            await asyncio.sleep(60)  # Check every minute
-        except Exception as e:
-            logger.error(f"Error in main loop: {e}")
-            await asyncio.sleep(60)
+    global clients
+    clients = []
+    try:
+        await init_db()
+        # Load recurring schedules from database
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT chat_id, text, media_path, interval_seconds FROM schedules WHERE is_recurring = 1")
+            recurring = await cursor.fetchall()
+            for chat_id, text, media_path, seconds in recurring:
+                async def recurring_task():
+                    clients = await load_session_clients()
+                    await send_message_with_session(clients, chat_id, text, media_path)
+                schedule.every(seconds).seconds.do(lambda: asyncio.create_task(recurring_task()))
+        await bot.start()
+        clients = await load_session_clients()
+        logger.info("Bot started")
+        # Set up signal handlers
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, lambda: handle_shutdown(loop, clients))
+        while True:
+            try:
+                await check_scheduled_messages()
+                schedule.run_pending()
+                await asyncio.sleep(60)  # Check every minute
+            except asyncio.CancelledError:
+                logger.info("Main loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in main loop: {e}")
+                await asyncio.sleep(60)
+    except Exception as e:
+        logger.error(f"Fatal error in main: {e}")
+    finally:
+        await shutdown(clients)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("KeyboardInterrupt received")
+    except Exception as e:
+        logger.error(f"Startup error: {e}")
