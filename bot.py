@@ -30,11 +30,8 @@ API_HASH = "13e303a526522f741c0680cfc8cd9c00"
 BOT_TOKEN = "7547436649:AAGtnui5bFEr-Dt9Qt1lKjtvwpw4F0cWpKs"
 ADMIN_ID = 6257711894
 
-# Initialize bot client
-bot = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
 # Directory for session files
-SESSION_DIR = "sessions> sessions"
+SESSION_DIR = "sessions"
 if not os.path.exists(SESSION_DIR):
     os.makedirs(SESSION_DIR)
 
@@ -59,7 +56,7 @@ async def init_db():
     logger.info("Database initialized")
 
 # Load session clients
-async def load_session_clients() -> List[Client]:
+async def load_session_clients(loop: asyncio.AbstractEventLoop) -> List[Client]:
     clients = []
     for session_file in os.listdir(SESSION_DIR):
         if session_file.endswith(".session"):
@@ -68,7 +65,8 @@ async def load_session_clients() -> List[Client]:
                 name=os.path.join(SESSION_DIR, session_name),
                 api_id=API_ID,
                 api_hash=API_HASH,
-                workdir=SESSION_DIR
+                workdir=SESSION_DIR,
+                loop=loop
             )
             try:
                 await client.start()
@@ -117,12 +115,13 @@ async def send_message_with_session(
         return False
 
 # Validate a session file
-async def validate_session(session_path: str, session_name: str) -> Tuple[bool, str]:
+async def validate_session(session_path: str, session_name: str, loop: asyncio.AbstractEventLoop) -> Tuple[bool, str]:
     client = Client(
         name=session_path,
         api_id=API_ID,
         api_hash=API_HASH,
-        workdir=os.path.dirname(session_path)
+        workdir=os.path.dirname(session_path),
+        loop=loop
     )
     try:
         await client.start()
@@ -143,8 +142,7 @@ async def validate_session(session_path: str, session_name: str) -> Tuple[bool, 
         return False, f"Validation failed: {e}"
 
 # Check and send scheduled messages
-async def check_scheduled_messages():
-    clients = await load_session_clients()
+async def check_scheduled_messages(clients: List[Client]):
     current_time = datetime.now()
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
@@ -186,7 +184,7 @@ async def handle_session_upload(client, message):
         await message.download(file_name=temp_path)
         session_name = f"user_{int(time.time())}"
         session_path = os.path.join(SESSION_DIR, f"{session_name}.session")
-        is_valid, status = await validate_session(temp_path, session_name)
+        is_valid, status = await validate_session(temp_path, session_name, client.loop)
         if is_valid:
             os.rename(temp_path, session_path)
             await message.reply(f"Session {session_name}.session is alive and stored!")
@@ -209,7 +207,7 @@ async def send_message(client, message):
         _, chat_id, *text = message.text.split(maxsplit=2)
         chat_id = int(chat_id) if chat_id.lstrip("-").isdigit() else chat_id
         text = text[0] if text else "Hello!"
-        clients = await load_session_clients()
+        clients = await load_session_clients(client.loop)
         if await send_message_with_session(clients, chat_id, text):
             await message.reply("Message sent!")
         else:
@@ -230,8 +228,8 @@ async def send_media(client, message):
             await message.reply("Media file not found.")
             logger.warning(f"Media file not found: {media_path}")
             return
-        clients = await load_session_clients()
-        if await send_message_with_session(clients, chat_id, caption, media_path):
+        clients = await load_session_clients(client.loop)
+        if await send_message_with_session(clients, chat_id, caption, message.document.file_id):
             await message.reply("Media sent!")
         else:
             await message.reply("Failed to send media.")
@@ -248,7 +246,7 @@ async def edit_message(client, message):
         chat_id = int(chat_id) if chat_id.lstrip("-").isdigit() else chat_id
         message_id = int(message_id)
         new_text = new_text[0] if new_text else "Edited message"
-        clients = await load_session_clients()
+        clients = await load_session_clients(client.loop)
         if clients:
             client = await get_next_client(clients)
             await client.edit_message_text(chat_id, message_id, new_text)
@@ -327,7 +325,7 @@ async def schedule_recurring(client, message):
             )
             await db.commit()
         async def recurring_task():
-            clients = await load_session_clients()
+            clients = await load_session_clients(client.loop)
             await send_message_with_session(clients, chat_id, text, media_path)
         schedule.every(seconds).seconds.do(lambda: asyncio.create_task(recurring_task()))
         await message.reply(f"Recurring message scheduled every {interval}!")
@@ -382,7 +380,7 @@ async def cancel_schedule(client, message):
             recurring = await cursor.fetchall()
             for chat_id, text, media_path, seconds in recurring:
                 async def recurring_task():
-                    clients = await load_session_clients()
+                    clients = await load_session_clients(client.loop)
                     await send_message_with_session(clients, chat_id, text, media_path)
                 schedule.every(seconds).seconds.do(lambda: asyncio.create_task(recurring_task()))
         await message.reply(f"Schedule {schedule_id} cancelled.")
@@ -402,7 +400,7 @@ async def send_buttons(client, message):
             [InlineKeyboardButton("Confirm", callback_data="confirm")],
             [InlineKeyboardButton("Cancel", callback_data="cancel")]
         ])
-        clients = await load_session_clients()
+        clients = await load_session_clients(client.loop)
         if clients:
             client = await get_next_client(clients)
             await client.send_message(chat_id, text, reply_markup=keyboard)
@@ -429,7 +427,7 @@ async def manage_sessions(client, message):
 @bot.on_message(filters.command("status") & filters.user(ADMIN_ID))
 async def check_status(client, message):
     try:
-        clients = await load_session_clients()
+        clients = await load_session_clients(client.loop)
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute("SELECT COUNT(*) FROM schedules")
             schedule_count = (await cursor.fetchone())[0]
@@ -500,25 +498,36 @@ async def shutdown(clients: List[Client]):
             logger.info(f"Stopped client {client.name}")
         except Exception as e:
             logger.error(f"Error stopping client {client.name}: {e}")
-    await bot.stop()
-    logger.info("Bot stopped")
-
-# Signal handler for graceful shutdown
-def handle_shutdown(loop, clients):
-    logger.info("Received shutdown signal")
-    asyncio.run_coroutine_threadsafe(shutdown(clients), loop)
-    tasks = [task for task in asyncio.all_tasks(loop) if task is not asyncio.current_task()]
+    try:
+        await bot.stop()
+        logger.info("Bot stopped")
+    except Exception as e:
+        logger.error(f"Error stopping bot: {e}")
+    tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
     for task in tasks:
         task.cancel()
-    loop.run_until_complete(loop.shutdown_asyncgens())
-    loop.close()
-    logger.info("Event loop closed")
-    exit(0)
+    logger.info("All tasks cancelled")
+
+# Signal handler for graceful shutdown
+async def handle_shutdown(clients: List[Client]):
+    await shutdown(clients)
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.shutdown_asyncgens()
+        loop.stop()
+        logger.info("Event loop stopped")
+    except Exception as e:
+        logger.error(f"Error during loop shutdown: {e}")
+    finally:
+        loop.close()
+        logger.info("Event loop closed")
 
 # Main function to run bot and scheduler
 async def main():
     global clients
     clients = []
+    loop = asyncio.get_running_loop()
+    bot.loop = loop  # Ensure bot uses the same loop
     try:
         await init_db()
         # Load recurring schedules from database
@@ -527,19 +536,18 @@ async def main():
             recurring = await cursor.fetchall()
             for chat_id, text, media_path, seconds in recurring:
                 async def recurring_task():
-                    clients = await load_session_clients()
+                    clients = await load_session_clients(loop)
                     await send_message_with_session(clients, chat_id, text, media_path)
                 schedule.every(seconds).seconds.do(lambda: asyncio.create_task(recurring_task()))
         await bot.start()
-        clients = await load_session_clients()
+        clients = await load_session_clients(loop)
         logger.info("Bot started")
         # Set up signal handlers
-        loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda: handle_shutdown(loop, clients))
+            signal.signal(sig, lambda signum, frame: asyncio.create_task(handle_shutdown(clients)))
         while True:
             try:
-                await check_scheduled_messages()
+                await check_scheduled_messages(clients)
                 schedule.run_pending()
                 await asyncio.sleep(60)  # Check every minute
             except asyncio.CancelledError:
@@ -551,10 +559,16 @@ async def main():
     except Exception as e:
         logger.error(f"Fatal error in main: {e}")
     finally:
-        await shutdown(clients)
+        await handle_shutdown(clients)
 
 if __name__ == "__main__":
     try:
+        # Check for TgCrypto
+        try:
+            import TgCrypto
+            logger.info("TgCrypto is installed")
+        except ImportError:
+            logger.warning("TgCrypto is missing! Performance may be slower.")
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt received")
